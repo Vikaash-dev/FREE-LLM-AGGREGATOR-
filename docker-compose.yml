@@ -6,19 +6,14 @@ services:
     ports:
       - "8000:8000"
     environment:
-      - HOST=0.0.0.0
-      - PORT=8000
-      - LOG_LEVEL=INFO
+      - DATABASE_URL=sqlite:///./data/model_memory.db
+      - REDIS_URL=redis://redis:6379
     volumes:
-      - ./credentials.json:/app/credentials.json
-      - ./logs:/app/logs
+      - ./data:/app/data
+      - ./.env:/app/.env
+    depends_on:
+      - redis
     restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 40s
 
   redis:
     image: redis:7-alpine
@@ -27,16 +22,14 @@ services:
     volumes:
       - redis_data:/data
     restart: unless-stopped
-    command: redis-server --appendonly yes
 
-  web-ui:
+  streamlit:
     build: .
-    command: ["streamlit", "run", "web_ui.py", "--server.address", "0.0.0.0", "--server.port", "8501"]
+    command: streamlit run web_ui.py --server.port=8501 --server.address=0.0.0.0
     ports:
       - "8501:8501"
     environment:
-      - STREAMLIT_SERVER_HEADLESS=true
-      - STREAMLIT_SERVER_ENABLE_CORS=false
+      - AGGREGATOR_URL=http://llm-aggregator:8000
     depends_on:
       - llm-aggregator
     restart: unless-stopped

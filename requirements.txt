@@ -2,6 +2,7 @@
 fastapi==0.104.1
 uvicorn==0.24.0
 pydantic==2.5.0
+pydantic-settings==2.1.0
 httpx==0.25.2
 aiohttp==3.9.1
 asyncio-throttle==1.0.2
@@ -10,16 +11,14 @@ asyncio-throttle==1.0.2
 sqlalchemy==2.0.23
 alembic==1.13.1
 redis==5.0.1
-# sqlite3 is built into Python
 
 # Security and encryption
-cryptography==41.0.8
+cryptography>=42.0.0
 python-jose[cryptography]==3.3.0
 passlib[bcrypt]==1.7.4
 
 # Configuration and environment
 python-dotenv==1.0.0
-pydantic-settings==2.1.0 # Added for centralized settings management
 pyyaml==6.0.1
 click==8.1.7
 
@@ -30,9 +29,9 @@ rich==13.7.0
 
 # Testing
 pytest==7.4.3
-pytest-asyncio==0.21.1
+pytest-asyncio==0.23.2
 pytest-mock==3.12.0
-httpx-mock==0.7.0
+respx>=0.20.0
 
 # Development tools
 black==23.11.0
@@ -40,7 +39,7 @@ isort==5.12.0
 flake8==6.1.0
 mypy==1.7.1
 
-# Optional: Web UI dependencies
+# Web UI dependencies
 streamlit==1.28.2
 plotly==5.17.0
 pandas==2.1.4
@@ -50,6 +49,6 @@ beautifulsoup4>=4.12.0
 playwright>=1.40.0
 lxml>=4.9.0
 
-# Enhanced research features
-torch>=2.0.0
-numpy>=1.24.0
+# Optional: Enhanced research features (install separately if needed)
+# torch>=2.0.0
+# numpy>=1.24.0

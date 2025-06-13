@@ -452,8 +452,13 @@ class MetaModelController:
         self.model_profiles = model_profiles
         
         if self.ml_enabled:
-            # Use DATABASE_URL from settings for ExternalMemorySystem
-            self.memory_system = ExternalMemorySystem(db_path=settings.DATABASE_URL)
+            # Convert SQLAlchemy URL to file path for ExternalMemorySystem
+            db_path = settings.DATABASE_URL
+            if db_path.startswith("sqlite:///"):
+                db_path = db_path.replace("sqlite:///", "")
+                if db_path.startswith("./"):
+                    db_path = db_path[2:]
+            self.memory_system = ExternalMemorySystem(db_path=db_path)
             self.complexity_analyzer = TaskComplexityAnalyzer()
             self.cascade_router = FrugalCascadeRouter(model_profiles)
         else:
