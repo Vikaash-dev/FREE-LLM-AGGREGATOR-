@@ -28,6 +28,11 @@ from core.rate_limiter import RateLimiter
 # but the objects might be expected by constructors.
 from models import ProviderConfig as OpenHandsProviderConfig, ProviderStatus
 
+# Import IntelligentResearchAssistant and its components, and ResearchQuery
+from core.researcher import IntelligentResearchAssistant
+from core.research_components import ContextualKeywordExtractor, WebResearcher, RelevanceScorer
+from core.research_structures import ResearchQuery, KnowledgeChunk
+
 
 logger = structlog.get_logger(__name__)
 
@@ -87,6 +92,20 @@ async def simulate_workflow(user_instruction: str):
     reasoner = ContextualReasoningEngine(llm_aggregator=llm_aggregator) # llm_aggregator for future use by reasoner
     state_tracker = StateTracker()
 
+    # Instantiate research components
+    keyword_extractor = ContextualKeywordExtractor(llm_aggregator=llm_aggregator)
+    web_researcher = WebResearcher() # Uses mock content, no LLM needed for itself
+    relevance_scorer = RelevanceScorer(llm_aggregator=llm_aggregator)
+
+    research_assistant = IntelligentResearchAssistant(
+        keyword_extractor=keyword_extractor,
+        web_researcher=web_researcher,
+        relevance_scorer=relevance_scorer,
+        llm_aggregator=llm_aggregator # For synthesis step
+    )
+    logger.info("IntelligentResearchAssistant initialized for simulation.")
+
+
     # 1. Create a ProjectContext (can be minimal for this simulation)
     project_ctx = ProjectContext(project_name="SimulatedProject", project_description="A project for workflow simulation.")
     logger.info("ProjectContext created", project_name=project_ctx.project_name, project_id=project_ctx.project_id)
@@ -133,22 +152,54 @@ async def simulate_workflow(user_instruction: str):
                 decision = reasoner.make_decision(reasoning_output)
                 logger.info("Decision made for task", task_id=task.task_id, decision_action=decision.get('action'), confidence=decision.get('confidence'))
                 state_tracker.update_task_reasoning(current_plan.plan_id, task.task_id, decision)
-                task.reasoning_log.append(str(decision)) # Store decision summary
+                task.reasoning_log.append(f"InitialReasoning: {decision}") # Store decision summary
 
-                # 4d. Simulate execution based on decision
+                # 4d. Potentially trigger research based on decision or task type
+                task_knowledge_chunks: List[KnowledgeChunk] = []
+                needs_research_keywords = ["research", "find information", "investigate", "what is", "how to", "learn about", "discover"]
+                trigger_research = any(kw in task.description.lower() for kw in needs_research_keywords) or \
+                                   (decision.get('action') == "NEEDS_CLARIFICATION" and decision.get('confidence', 1.0) < 0.6)
+
+                if trigger_research:
+                    logger.info("Task flagged for research, invoking IntelligentResearchAssistant.", task_id=task.task_id)
+                    project_summary_for_research = project_ctx.project_description if project_ctx else None
+
+                    current_research_query = ResearchQuery(
+                        original_task_description=task.description,
+                        project_context_summary=project_summary_for_research
+                        # keywords will be extracted by the research_assistant
+                    )
+
+                    task_knowledge_chunks = await research_assistant.research_for_task(current_research_query)
+
+                    if task_knowledge_chunks:
+                        logger.info("Research completed for task, knowledge chunks obtained.",
+                                    task_id=task.task_id, num_chunks=len(task_knowledge_chunks))
+                        task.reasoning_log.append(f"ResearchSummary: Found {len(task_knowledge_chunks)} knowledge chunks. First chunk: {task_knowledge_chunks[0].content[:100]}..." if task_knowledge_chunks else "No chunks.")
+                        # Here, one might re-evaluate the task or decision based on new knowledge.
+                        # For this simulation, we'll just log it and potentially adjust the task message.
+                    else:
+                        logger.info("Research completed for task, but no knowledge chunks were synthesized.", task_id=task.task_id)
+                        task.reasoning_log.append("ResearchSummary: No knowledge chunks synthesized.")
+
+                # 4e. Simulate execution based on decision (and potentially research)
                 if decision.get('action') == "PROCEED":
-                    # Simulate successful execution
                     time.sleep(0.1) # Simulate work
-                    task_result = TaskResult(task_id=task.task_id, status=TaskStatus.COMPLETED, message="Task simulated successfully.")
+                    sim_message = "Task simulated successfully."
+                    if task_knowledge_chunks:
+                        sim_message += f" (Research found {len(task_knowledge_chunks)} knowledge chunks that could be used)."
+                    task_result = TaskResult(task_id=task.task_id, status=TaskStatus.COMPLETED, message=sim_message)
                     task.status = TaskStatus.COMPLETED
-                    task.output = "Simulated output data."
+                    task.output = "Simulated output data. " + (f"Knowledge chunks: {[k.content for k in task_knowledge_chunks]}" if task_knowledge_chunks else "")
                     state_tracker.complete_task(current_plan.plan_id, task.task_id, task.status.value, task_result.message, output_summary="Simulated output produced.")
                 else: # NEEDS_CLARIFICATION
-                    task_result = TaskResult(task_id=task.task_id, status=TaskStatus.CLARIFICATION_NEEDED, message=decision.get('details'))
+                    clarification_message = decision.get('details', "Task requires clarification.")
+                    if task_knowledge_chunks: # If research was done due to clarification, it might alter the message
+                        clarification_message += f" Research attempted and found {len(task_knowledge_chunks)} chunks; review them to refine the task."
+
+                    task_result = TaskResult(task_id=task.task_id, status=TaskStatus.CLARIFICATION_NEEDED, message=clarification_message)
                     task.status = TaskStatus.CLARIFICATION_NEEDED
-                    all_tasks_successful = False # If any task needs clarification, plan isn't fully successful
-                    # No specific fail_task call here, as CLARIFICATION_NEEDED is a valid intermediate state.
-                    # The state_tracker.update_task_reasoning already logged a 'task_clarification_needed' event.
+                    all_tasks_successful = False
                     state_tracker.complete_task(current_plan.plan_id, task.task_id, task.status.value, task_result.message)
 
 
