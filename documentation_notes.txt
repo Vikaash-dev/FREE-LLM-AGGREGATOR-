@@ -1,0 +1,8 @@
+Documentation Update Required:
+- Explain in README.md or SECURITY.md that credentials should now be primarily managed via environment variables.
+- Provide the naming convention:
+    - `OPENHANDS_ENCRYPTION_KEY` for the master encryption key.
+    - `OPENHANDS_PROVIDER_{PROVIDER_NAME}_ACCOUNT_{ACCOUNT_ID}_API_KEY` for API keys.
+    - `OPENHANDS_PROVIDER_{PROVIDER_NAME}_ACCOUNT_{ACCOUNT_ID}_ADDITIONAL_HEADERS` (JSON string) for any additional headers.
+- Mention that `credentials.json` is deprecated and will be removed. If used, `OPENHANDS_ENCRYPTION_KEY` must be set for it to be decryptable across sessions.
+- Strongly advise setting `OPENHANDS_ENCRYPTION_KEY` in production.
