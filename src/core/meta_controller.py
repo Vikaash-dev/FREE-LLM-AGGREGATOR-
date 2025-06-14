@@ -17,6 +17,7 @@ import asyncio
 from collections import defaultdict
 import sqlite3
 import pickle
+import structlog # Changed from logging
 
 from src.config import settings # Centralized settings
 
@@ -456,8 +457,9 @@ class MetaModelController:
             self.memory_system = ExternalMemorySystem(db_path=settings.DATABASE_URL)
             self.complexity_analyzer = TaskComplexityAnalyzer()
             self.cascade_router = FrugalCascadeRouter(model_profiles)
+            logger.info("MetaModelController initialized with ML features enabled.")
         else:
-            print("Warning: PyTorch not available. Using fallback model selection.")
+            logger.warning("PyTorch not available or ML features disabled. Using fallback model selection.", ml_enabled=self.ml_enabled, torch_available=TORCH_AVAILABLE)
             self.memory_system = None
             self.complexity_analyzer = None
             self.cascade_router = None
@@ -476,8 +478,10 @@ class MetaModelController:
         Select the optimal model for a given request.
         Returns (model_name, confidence_score).
         """
+        start_time = datetime.utcnow()
         
         if not self.ml_enabled:
+            logger.debug("ML features disabled, using fallback model selection.", request_id=request.id if hasattr(request, 'id') else 'N/A', user_id=user_id)
             return self._fallback_model_selection(request)
         
         # Analyze task complexity
@@ -524,12 +528,22 @@ class MetaModelController:
         
         # Select best model
         if model_scores:
-            best_model = max(model_scores.items(), key=lambda x: x[1])
-            return best_model[0], best_model[1]
-        
-        # Fallback to cascade routing
+            best_model_name, best_score = max(model_scores.items(), key=lambda x: x[1])
+            logger.info("Optimal model selected",
+                        best_model=best_model_name,
+                        confidence=round(best_score, 2),
+                        task_complexity=task_complexity.overall_complexity,
+                        num_candidates=len(candidate_models),
+                        user_id=user_id,
+                        processing_time_ms=(datetime.utcnow() - start_time).total_seconds() * 1000)
+            return best_model_name, best_score
+
+        # Fallback to cascade routing if no scores
+        logger.warning("No model scores generated, falling back to cascade routing.", task_hash=task_hash, user_id=user_id)
         cascade_chain = self.cascade_router.get_cascade_chain(task_complexity)
-        return cascade_chain[0] if cascade_chain else "auto", 0.5
+        fallback_model = cascade_chain[0] if cascade_chain else "auto" # Default to "auto" if cascade is empty
+        logger.info("Fallback model selection due to no scores", fallback_model=fallback_model, user_id=user_id)
+        return fallback_model, 0.5 # Default confidence for fallback
     
     async def get_cascade_chain(self, request: ChatCompletionRequest) -> List[str]:
         """Get the full cascade chain for a request."""
@@ -541,11 +555,14 @@ class MetaModelController:
             # Here, we'll return a list that implies default/auto behavior.
             # Consider what the calling code expects in a non-ML scenario.
             # Returning the result of _fallback_model_selection's model might be one option.
+            logger.debug("ML features disabled, providing fallback cascade chain.", request_id=request.id if hasattr(request, 'id') else 'N/A')
             selected_model, _ = self._fallback_model_selection(request)
             return [selected_model]
 
         task_complexity = self.complexity_analyzer.analyze_task_complexity(request)
-        return self.cascade_router.get_cascade_chain(task_complexity)
+        chain = self.cascade_router.get_cascade_chain(task_complexity)
+        logger.debug("Generated cascade chain", chain=chain, task_complexity=task_complexity.overall_complexity)
+        return chain
     
     async def update_performance_feedback(self, model_name: str, request: ChatCompletionRequest,
                                         success: bool, response_time: float, 
@@ -556,10 +573,11 @@ class MetaModelController:
             # If ML features are disabled, no complex feedback mechanism is in place.
             # We could potentially update basic stats if model_profiles had them directly
             # and weren't tied to ML-only structures, but current design ties feedback to ML parts.
+            logger.debug("ML features disabled, skipping performance feedback update.", model_name=model_name)
             return
 
         task_complexity = self.complexity_analyzer.analyze_task_complexity(request)
-        task_type = self._classify_task_type(request)
+        task_type = self._classify_task_type(request) # This could be logged as well
         task_hash = self._generate_task_hash(request)
         
         # Store performance data
@@ -570,13 +588,14 @@ class MetaModelController:
             complexity_score=task_complexity.overall_complexity,
             success_rate=1.0 if success else 0.0,
             response_time=response_time,
-            user_satisfaction=user_satisfaction or (0.8 if success else 0.2),
+            user_satisfaction=user_satisfaction or (0.8 if success else 0.2), # Default satisfaction
             task_hash=task_hash
         )
+        logger.info("Performance data stored", model_name=model_name, task_type=task_type, success=success, response_time=response_time)
         
         # Update model profile if needed
         if model_name in self.model_profiles:
-            self._update_model_profile(model_name, task_complexity, success, response_time)
+            self._update_model_profile(model_name, task_complexity, success, response_time) # This method could log changes
     
     def _get_candidate_models(self, task_complexity: TaskComplexity, 
                             similar_tasks: List[Dict]) -> List[str]:
@@ -789,4 +808,8 @@ class MetaModelController:
         else:
             # Fallback to first available model
             first_model = list(self.model_profiles.keys())[0] if self.model_profiles else "gpt-3.5-turbo"
+            logger.info("Fallback model selection chosen", model_name=first_model, confidence=0.5)
             return first_model, 0.5
+
+# Initialize logger for the module if it's used outside the class context (unlikely here)
+logger = structlog.get_logger(__name__)

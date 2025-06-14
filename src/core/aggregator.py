@@ -3,10 +3,13 @@ Main LLM Aggregator class that orchestrates provider selection and routing.
 """
 
 import asyncio
-import logging
+import structlog # Changed from logging
 import random
 import time
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
+from collections import defaultdict
+from datetime import datetime, timedelta
+import httpx # Added for specific exception handling
 
 from ..models import (
     ChatCompletionRequest,
@@ -27,11 +30,19 @@ from .auto_updater import AutoUpdater, integrate_auto_updater
 from src.config import settings # Centralized settings
 
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__) # Changed from logging
 
 
 class LLMAggregator:
-    """Main LLM API Aggregator class."""
+    """
+    Orchestrates interactions with multiple Language Model (LLM) providers.
+
+    This class manages a pool of LLM providers, selects appropriate providers
+    for incoming requests, handles retries, rate limiting, and advanced features
+    like meta-controller based model selection, ensemble responses, and auto-updates
+    for provider configurations. It aims to provide a unified and resilient interface
+    for accessing various LLMs.
+    """
     
     def __init__(
         self,
@@ -39,16 +50,35 @@ class LLMAggregator:
         account_manager: AccountManager,
         router: ProviderRouter,
         rate_limiter: RateLimiter,
-        max_retries: Optional[int] = None, # Will be sourced from settings
-        retry_delay: Optional[float] = None, # Will be sourced from settings
+        max_retries: Optional[int] = None,
+        retry_delay: Optional[float] = None,
         enable_meta_controller: bool = True,
         enable_ensemble: bool = False,
         enable_auto_updater: bool = True,
-        auto_update_interval: Optional[int] = None # Will be sourced from settings
+        auto_update_interval: Optional[int] = None
     ):
-        self.providers = {provider.name: provider for provider in providers}
-        self.account_manager = account_manager
-        self.router = router
+        """
+        Initializes the LLMAggregator.
+
+        Args:
+            providers: A list of initialized provider instances (e.g., OpenAIProvider).
+            account_manager: Manages credentials for different providers.
+            router: Determines the order/selection of providers for a request.
+            rate_limiter: Handles rate limiting for API requests.
+            max_retries: Maximum number of retries for a request to a provider.
+                         Sources from settings if None.
+            retry_delay: Initial delay in seconds between retries.
+                         Sources from settings if None.
+            enable_meta_controller: Flag to enable the meta-controller for intelligent
+                                    model selection.
+            enable_ensemble: Flag to enable ensemble methods for responses.
+            enable_auto_updater: Flag to enable automatic updates of provider info.
+            auto_update_interval: Interval in minutes for auto-updater.
+                                  Sources from settings if None.
+        """
+        self.providers: Dict[str, BaseProvider] = {provider.name: provider for provider in providers}
+        self.account_manager: AccountManager = account_manager
+        self.router: ProviderRouter = router
         self.rate_limiter = rate_limiter
         
         # Enhanced features
@@ -56,6 +86,12 @@ class LLMAggregator:
         self.enable_ensemble = enable_ensemble
         self.enable_auto_updater = enable_auto_updater
         
+        # Circuit Breaker Attributes
+        self.provider_failure_counts: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
+        self.provider_circuit_open_until: Dict[str, Dict[str, datetime]] = defaultdict(lambda: defaultdict(datetime))
+        self.CIRCUIT_BREAKER_THRESHOLD = 3  # Max failures before opening circuit
+        self.CIRCUIT_BREAKER_COOLDOWN_SECONDS = 300  # 5 minutes cooldown
+
         # Configuration from settings or defaults
         self.max_retries = max_retries if max_retries is not None else settings.MAX_RETRIES
         self.retry_delay = retry_delay if retry_delay is not None else settings.RETRY_DELAY
@@ -81,9 +117,11 @@ class LLMAggregator:
         else:
             self.auto_updater = None
         
-        logger.info(f"Initialized LLM Aggregator with {len(self.providers)} providers")
-        logger.info(f"Meta-controller enabled: {self.enable_meta_controller}")
-        logger.info(f"Ensemble system enabled: {self.enable_ensemble}")
+        logger.info("LLM Aggregator initialized",
+                    num_providers=len(self.providers),
+                    meta_controller_enabled=self.enable_meta_controller,
+                    ensemble_system_enabled=self.enable_ensemble,
+                    auto_updater_enabled=self.enable_auto_updater)
     
     def _initialize_meta_controller(self) -> MetaModelController:
         """Initialize the meta-controller with model capability profiles."""
@@ -273,9 +311,30 @@ class LLMAggregator:
         request: ChatCompletionRequest,
         user_id: Optional[str] = None
     ) -> ChatCompletionResponse:
-        """Perform chat completion with intelligent provider selection and optional ensemble."""
+        """
+        Processes a chat completion request.
+
+        This method selects an appropriate LLM provider (potentially using a meta-controller
+        or ensemble methods if enabled), sends the request, and returns the response.
+        It handles rate limiting and ensures that streaming requests are directed to
+        `chat_completion_stream`.
+
+        Args:
+            request: The chat completion request object.
+            user_id: Optional identifier for the user making the request, used for
+                     rate limiting and potentially for personalized routing.
+
+        Returns:
+            A ChatCompletionResponse object from the selected provider.
+
+        Raises:
+            ValueError: If a streaming request is made to this non-streaming endpoint.
+            ProviderError: If all attempts to get a response from providers fail.
+            RateLimitExceeded: If the user exceeds their rate limits.
+        """
         
         if request.stream:
+            logger.error("Streaming request made to non-streaming endpoint", request_id=getattr(request, 'id', 'N/A'))
             raise ValueError("Use chat_completion_stream for streaming requests")
         
         # Apply rate limiting
@@ -307,14 +366,22 @@ class LLMAggregator:
         start_time = time.time()
         
         # Get optimal model from meta-controller
-        optimal_model, confidence = await self.meta_controller.select_optimal_model(request, user_id)
+        optimal_model, confidence = await self.meta_controller.select_optimal_model(request, user_id) # user_id might be useful here
         
-        logger.info(f"Meta-controller selected model: {optimal_model} (confidence: {confidence:.2f})")
+        logger.info("Meta-controller model selection",
+                    selected_model=optimal_model,
+                    confidence=round(confidence, 2),
+                    user_id=user_id,
+                    request_model=request.model) # Log initial request model
         
         # If confidence is low, get cascade chain
         if confidence < 0.7:
             cascade_chain = await self.meta_controller.get_cascade_chain(request)
-            logger.info(f"Low confidence, using cascade: {cascade_chain}")
+            logger.info("Low confidence, using cascade chain",
+                        cascade_chain=cascade_chain,
+                        selected_model=optimal_model,
+                        confidence=round(confidence,2),
+                        user_id=user_id)
         else:
             cascade_chain = [optimal_model]
         
@@ -341,26 +408,39 @@ class LLMAggregator:
                     # Update performance feedback
                     response_time = time.time() - start_time
                     await self.meta_controller.update_performance_feedback(
-                        model_name, request, True, response_time, None
+                        model_name, request, True, response_time, None # Error details are None for success
                     )
                     
-                    logger.info(f"Successfully completed request using {model_name} via {provider_name}")
+                    logger.info("Meta-controller: Successfully completed request",
+                                model_used=model_name,
+                                provider=provider_name,
+                                response_time=response_time,
+                                user_id=user_id)
                     return response
                     
-            except Exception as e:
-                logger.warning(f"Model {model_name} failed: {e}")
+            except Exception as e: # This is a broad catch, specific errors are handled in _try_provider
+                logger.warning("Meta-controller: Model failed in cascade",
+                               model_name=model_name,
+                               provider=provider_name, # provider_name might not be set if model not found in any provider
+                               error=str(e),
+                               user_id=user_id,
+                               exc_info=True) # Log stack trace for unexpected errors
                 # Update performance feedback for failure
-                response_time = time.time() - start_time
+                response_time = time.time() - start_time # Recalculate response_time for accuracy
                 await self.meta_controller.update_performance_feedback(
                     model_name, request, False, response_time, None
                 )
                 if provider_name: # Ensure provider_name was found
                     self.router.update_provider_score(provider_name, success=False, model_name=model_name)
-                last_error = e
+                last_error = e # last_error should ideally be a ProviderError or similar structured error.
                 continue
         
         # If all models in cascade failed, fallback to traditional routing
-        logger.warning(f"Meta-controller cascade failed. Last error: {last_error}. Falling back to traditional routing.")
+        logger.warning("Meta-controller cascade failed, falling back to traditional routing",
+                       last_error=str(last_error) if last_error else "No specific error", # Log last error if available
+                       user_id=user_id,
+                       request_model=request.model,
+                       exc_info=True if last_error else False) # Log stack trace if an error occurred
         return await self._chat_completion_traditional(request, user_id)
     
     async def _chat_completion_with_ensemble(
@@ -416,24 +496,37 @@ class LLMAggregator:
                         'confidence': 0.8,  # Default confidence
                         'cost_estimate': 0.0
                     }
-            except Exception as e:
-                logger.warning(f"Ensemble model {model_name} failed: {e}")
+            except Exception as e: # Broad catch, specific errors are in _try_provider
+                logger.warning("Ensemble model failed",
+                               model_name=model_name,
+                               provider=provider_name,
+                               error=str(e),
+                               user_id=user_id, # Assuming user_id is accessible here
+                               exc_info=True)
                 continue
         
         # If we have multiple responses, use ensemble system
         if len(model_responses) > 1:
-            logger.info(f"Generating ensemble response from {len(model_responses)} models")
+            logger.info("Generating ensemble response",
+                        num_models_participating=len(model_responses),
+                        models=list(model_responses.keys()),
+                        user_id=user_id)
             return await self.ensemble_system.generate_ensemble_response(
                 request, model_responses, model_metadata
             )
         
         # If only one response, return it
         elif model_responses:
+            logger.info("Ensemble: Only one model succeeded, returning its response",
+                        model_returned=list(model_responses.keys())[0],
+                        user_id=user_id)
             return list(model_responses.values())[0]
         
         # If no responses, fallback to traditional routing
         else:
-            logger.warning("Ensemble failed, falling back to traditional routing")
+            logger.warning("Ensemble failed: No models returned a response, falling back to traditional routing",
+                           user_id=user_id,
+                           request_model=request.model)
             return await self._chat_completion_traditional(request, user_id)
     
     async def _get_model_response(self, provider_name: str, model_name: str, 
@@ -459,29 +552,41 @@ class LLMAggregator:
         last_error = None
         for provider_name in provider_chain:
             try:
-                response = await self._try_provider(provider_name, request)
+                response = await self._try_provider(provider_name, request) # _try_provider logs its own specifics
                 if response:
-                    logger.info(f"Successfully completed request using {provider_name}")
+                    logger.info("Traditional routing: Successfully completed request",
+                                provider_used=provider_name,
+                                model_requested=request.model, # Actual model used is logged in _try_provider
+                                user_id=user_id)
                     return response
-                    
+            # These specific errors are already handled and logged in _try_provider and re-raised.
+            # The circuit breaker logic in _try_provider handles repeated failures.
+            # Logging them again here would be redundant unless we want a summary log after trying a provider.
             except RateLimitError as e:
-                logger.warning(f"Rate limit hit for {provider_name}: {e}")
+                logger.debug("Traditional routing: Rate limit hit, trying next provider", provider=provider_name, error=str(e), user_id=user_id)
                 last_error = e
                 continue
-                
             except AuthenticationError as e:
-                logger.error(f"Authentication failed for {provider_name}: {e}")
-                # Mark credentials as invalid
-                await self.account_manager.mark_credentials_invalid(provider_name)
+                logger.debug("Traditional routing: Authentication failed, trying next provider", provider=provider_name, error=str(e), user_id=user_id)
+                # mark_credentials_invalid is called in _try_provider
                 last_error = e
                 continue
-                
-            except ProviderError as e:
-                logger.warning(f"Provider error for {provider_name}: {e}")
+            except ProviderError as e: # Includes errors from circuit breaker like "Circuit Open"
+                logger.debug("Traditional routing: Provider error, trying next provider", provider=provider_name, error=str(e), user_id=user_id)
                 last_error = e
                 continue
-        
+            except Exception as e: # Catch any other unexpected error from _try_provider if it wasn't wrapped
+                logger.warning("Traditional routing: Unexpected error from provider, trying next", provider=provider_name, error=str(e), user_id=user_id, exc_info=True)
+                last_error = e
+                continue
+
         # If we get here, all providers failed
+        logger.error("Traditional routing: All providers failed",
+                     last_error=str(last_error) if last_error else "No specific error",
+                     provider_chain_tried=provider_chain,
+                     user_id=user_id,
+                     request_model=request.model,
+                     exc_info=True if last_error else False)
         raise ProviderError(f"All providers failed. Last error: {last_error}")
     
     async def chat_completion_stream(
@@ -489,7 +594,23 @@ class LLMAggregator:
         request: ChatCompletionRequest,
         user_id: Optional[str] = None
     ) -> AsyncGenerator[ChatCompletionResponse, None]:
-        """Perform streaming chat completion."""
+        """
+        Processes a streaming chat completion request.
+
+        This method selects an appropriate LLM provider and streams the response back
+        as an asynchronous generator. It handles rate limiting.
+
+        Args:
+            request: The chat completion request object, with `stream` set to True.
+            user_id: Optional identifier for the user making the request.
+
+        Yields:
+            ChatCompletionResponse: Chunks of the streaming response from the provider.
+
+        Raises:
+            ProviderError: If all attempts to get a response from providers fail.
+            RateLimitExceeded: If the user exceeds their rate limits.
+        """
         
         # Apply rate limiting
         await self.rate_limiter.acquire(user_id)
@@ -501,25 +622,34 @@ class LLMAggregator:
             # Try providers in order
             for provider_name in provider_chain:
                 try:
-                    async for chunk in self._try_provider_stream(provider_name, request):
+                    async for chunk in self._try_provider_stream(provider_name, request): # _try_provider_stream logs its own specifics
                         yield chunk
+                    logger.info("Streaming: Successfully completed stream",
+                                provider_used=provider_name,
+                                model_requested=request.model, # Actual model used is logged in _try_provider_stream
+                                user_id=user_id)
                     return  # Successfully completed
                     
                 except RateLimitError as e:
-                    logger.warning(f"Rate limit hit for {provider_name}: {e}")
+                    logger.debug("Streaming: Rate limit hit, trying next provider", provider=provider_name, error=str(e), user_id=user_id)
                     continue
-                    
                 except AuthenticationError as e:
-                    logger.error(f"Authentication failed for {provider_name}: {e}")
-                    await self.account_manager.mark_credentials_invalid(provider_name)
+                    logger.debug("Streaming: Authentication failed, trying next provider", provider=provider_name, error=str(e), user_id=user_id)
+                    # mark_credentials_invalid is called in _try_provider_stream
                     continue
-                    
                 except ProviderError as e:
-                    logger.warning(f"Provider error for {provider_name}: {e}")
+                    logger.debug("Streaming: Provider error, trying next provider", provider=provider_name, error=str(e), user_id=user_id)
+                    continue
+                except Exception as e: # Catch any other unexpected error
+                    logger.warning("Streaming: Unexpected error from provider, trying next", provider=provider_name, error=str(e), user_id=user_id, exc_info=True)
                     continue
             
             # If we get here, all providers failed
-            raise ProviderError("All providers failed for streaming request")
+            logger.error("Streaming: All providers failed",
+                         provider_chain_tried=provider_chain,
+                         user_id=user_id,
+                         request_model=request.model)
+            raise ProviderError("All providers failed for streaming request") # Consider more specific error or structured response
             
         finally:
             self.rate_limiter.release(user_id)
@@ -539,86 +669,212 @@ class LLMAggregator:
         provider_name: str,
         request: ChatCompletionRequest
     ) -> Optional[ChatCompletionResponse]:
-        """Try to complete request with specific provider."""
+        """Try to complete request with specific provider, including circuit breaker and refined error handling."""
         
+        # Provider check should happen before model resolution for circuit breaker key
         provider = self.providers.get(provider_name)
         if not provider or not provider.is_available:
+            logger.debug("_try_provider: Provider not found or unavailable", provider_name=provider_name)
             return None
         
         # Get credentials for this provider
         credentials = await self.account_manager.get_credentials(provider_name)
         if not credentials:
-            logger.warning(f"No valid credentials for {provider_name}")
+            logger.warning("No valid credentials for provider", provider_name=provider_name, model_requested=request.model)
             return None
         
         # Resolve model name if "auto" is specified
-        model_name = request.model
+        model_name = request.model # This is the model_name used for circuit breaker key initially
         if model_name == "auto":
-            model_name = await self._select_model(provider, request)
-            if not model_name:
-                logger.warning(f"No suitable model found for {provider_name}")
+            # We need to select the model first to get the actual model_name for circuit breaker
+            # This means the circuit check for "auto" might be less specific or happen after model selection
+            # For simplicity, the circuit for "auto" could be generic for the provider,
+            # or we check *after* model_name is resolved.
+            # Let's refine: check circuit AFTER model_name is resolved.
+            pass # Will resolve model_name later
+
+        # If model_name is not "auto", check circuit now.
+        if model_name != "auto":
+            open_until = self.provider_circuit_open_until[provider_name].get(model_name)
+            if open_until and datetime.utcnow() < open_until:
+                logger.warning("Circuit open for model", provider_name=provider_name, model_name=model_name, open_until=open_until.isoformat())
+                return None # Circuit is open for this specific model
+
+        # Resolve actual model name if "auto"
+        if request.model == "auto": # Use request.model here, as model_name might have been changed above
+            resolved_model_name = await self._select_model(provider, request) # _select_model could log its choice/failure
+            if not resolved_model_name:
+                logger.warning("No suitable model found by _select_model", provider_name=provider_name, original_request_model=request.model)
+                # Consider this a failure for "auto" on this provider
+                self.provider_failure_counts[provider_name]["auto"] += 1 # Use "auto" as key
+                if self.provider_failure_counts[provider_name]["auto"] >= self.CIRCUIT_BREAKER_THRESHOLD:
+                    self.provider_circuit_open_until[provider_name]["auto"] = datetime.utcnow() + timedelta(seconds=self.CIRCUIT_BREAKER_COOLDOWN_SECONDS)
+                    self.provider_failure_counts[provider_name]["auto"] = 0
+                    logger.error("Circuit for 'auto' model selection opened", provider_name=provider_name, cooldown_seconds=self.CIRCUIT_BREAKER_COOLDOWN_SECONDS)
                 return None
-        
+            model_name = resolved_model_name # This is the actual model_name to be used
+            logger.info("Model 'auto' resolved", provider_name=provider_name, resolved_model_name=model_name)
+
+            # Now check circuit for the resolved model_name
+            open_until = self.provider_circuit_open_until[provider_name].get(model_name)
+            if open_until and datetime.utcnow() < open_until:
+                logger.warning("Circuit open for resolved 'auto' model", provider_name=provider_name, model_name=model_name, open_until=open_until.isoformat())
+                return None
+
+
         # Create request with resolved model
         resolved_request = request.copy()
-        resolved_request.model = model_name
+        resolved_request.model = model_name # model_name is now the resolved one
         
         # Attempt request with retries
         for attempt in range(self.max_retries):
             try:
+                # model_name here is the one used for the actual API call and for circuit breaker logic on failure/success
                 response = await provider.chat_completion(resolved_request, credentials)
                 
                 # Update credentials usage
                 await self.account_manager.update_usage(credentials)
                 
+                # Success: reset failure count for this provider/model
+                self.provider_failure_counts[provider_name][model_name] = 0
+                # Optionally log if circuit was closed:
+                if self.provider_circuit_open_until[provider_name].get(model_name) and \
+                   self.provider_circuit_open_until[provider_name][model_name] < datetime.utcnow(): # Check if it was open and now it's past cooldown
+                    logger.info("Circuit closed due to successful call", provider_name=provider_name, model_name=model_name)
+                
                 return response
-                
+
+            # Specific httpx errors
+            except httpx.ReadTimeout as e:
+                logger.warning("ReadTimeout from provider", provider_name=provider_name, model_name=model_name, attempt=attempt + 1, max_retries=self.max_retries, error=str(e))
+                self.provider_failure_counts[provider_name][model_name] += 1
+                if self.provider_failure_counts[provider_name][model_name] >= self.CIRCUIT_BREAKER_THRESHOLD:
+                    self.provider_circuit_open_until[provider_name][model_name] = datetime.utcnow() + timedelta(seconds=self.CIRCUIT_BREAKER_COOLDOWN_SECONDS)
+                    self.provider_failure_counts[provider_name][model_name] = 0
+                    logger.error("Circuit opened due to ReadTimeouts", provider_name=provider_name, model_name=model_name, cooldown_seconds=self.CIRCUIT_BREAKER_COOLDOWN_SECONDS)
+                if attempt == self.max_retries - 1:
+                    raise ProviderError(f"ReadTimeout with {provider_name}/{model_name} after {self.max_retries} attempts: {e}") from e
+            except httpx.ConnectError as e:
+                logger.warning("ConnectError with provider", provider_name=provider_name, model_name=model_name, attempt=attempt + 1, max_retries=self.max_retries, error=str(e))
+                self.provider_failure_counts[provider_name][model_name] += 1
+                if self.provider_failure_counts[provider_name][model_name] >= self.CIRCUIT_BREAKER_THRESHOLD:
+                    self.provider_circuit_open_until[provider_name][model_name] = datetime.utcnow() + timedelta(seconds=self.CIRCUIT_BREAKER_COOLDOWN_SECONDS)
+                    self.provider_failure_counts[provider_name][model_name] = 0
+                    logger.error("Circuit opened due to ConnectErrors", provider_name=provider_name, model_name=model_name, cooldown_seconds=self.CIRCUIT_BREAKER_COOLDOWN_SECONDS)
+                if attempt == self.max_retries - 1:
+                    raise ProviderError(f"ConnectError with {provider_name}/{model_name} after {self.max_retries} attempts: {e}") from e
+            except httpx.HTTPStatusError as e:
+                logger.warning("HTTPStatusError from provider",
+                               provider_name=provider_name, model_name=model_name, attempt=attempt + 1, max_retries=self.max_retries,
+                               status_code=e.response.status_code, response_text=e.response.text[:200], error=str(e))
+                self.provider_failure_counts[provider_name][model_name] += 1
+                if self.provider_failure_counts[provider_name][model_name] >= self.CIRCUIT_BREAKER_THRESHOLD:
+                    self.provider_circuit_open_until[provider_name][model_name] = datetime.utcnow() + timedelta(seconds=self.CIRCUIT_BREAKER_COOLDOWN_SECONDS)
+                    self.provider_failure_counts[provider_name][model_name] = 0
+                    logger.error("Circuit opened due to HTTPStatusErrors", provider_name=provider_name, model_name=model_name, status_code=e.response.status_code, cooldown_seconds=self.CIRCUIT_BREAKER_COOLDOWN_SECONDS)
+                if attempt == self.max_retries - 1:
+                    raise ProviderError(f"HTTPStatusError {e.response.status_code} with {provider_name}/{model_name} after {self.max_retries} attempts: {e}") from e
+            except httpx.RequestError as e:
+                logger.warning("RequestError with provider", provider_name=provider_name, model_name=model_name, attempt=attempt + 1, max_retries=self.max_retries, error=str(e))
+                self.provider_failure_counts[provider_name][model_name] += 1
+                if self.provider_failure_counts[provider_name][model_name] >= self.CIRCUIT_BREAKER_THRESHOLD:
+                    self.provider_circuit_open_until[provider_name][model_name] = datetime.utcnow() + timedelta(seconds=self.CIRCUIT_BREAKER_COOLDOWN_SECONDS)
+                    self.provider_failure_counts[provider_name][model_name] = 0
+                    logger.error("Circuit opened due to RequestErrors", provider_name=provider_name, model_name=model_name, cooldown_seconds=self.CIRCUIT_BREAKER_COOLDOWN_SECONDS)
+                if attempt == self.max_retries - 1:
+                    raise ProviderError(f"RequestError with {provider_name}/{model_name} after {self.max_retries} attempts: {e}") from e
+
             except RateLimitError:
-                # Don't retry rate limit errors
-                logger.warning(f"RateLimitError with {provider_name} for model {model_name}. Not retrying.")
+                logger.warning("RateLimitError from provider, not retrying or opening circuit", provider_name=provider_name, model_name=model_name)
                 raise
-                
-            except ProviderError as e:
-                logger.warning(f"ProviderError with {provider_name} for model {model_name} (attempt {attempt + 1}/{self.max_retries}): {e}")
+            except AuthenticationError as e:
+                logger.error("AuthenticationError from provider, marking credentials invalid", provider_name=provider_name, model_name=model_name, error=str(e), account_id=credentials.account_id)
+                await self.account_manager.mark_credentials_invalid(provider_name, credentials.account_id)
+                raise
+
+            except ProviderError as e: # General provider error from the provider's SDK
+                logger.warning("ProviderError from provider", provider_name=provider_name, model_name=model_name, attempt=attempt + 1, max_retries=self.max_retries, error=str(e), exc_info=True) # exc_info for better context
+                self.provider_failure_counts[provider_name][model_name] += 1
+                if self.provider_failure_counts[provider_name][model_name] >= self.CIRCUIT_BREAKER_THRESHOLD:
+                    self.provider_circuit_open_until[provider_name][model_name] = datetime.utcnow() + timedelta(seconds=self.CIRCUIT_BREAKER_COOLDOWN_SECONDS)
+                    self.provider_failure_counts[provider_name][model_name] = 0
+                    logger.error("Circuit opened due to ProviderErrors", provider_name=provider_name, model_name=model_name, cooldown_seconds=self.CIRCUIT_BREAKER_COOLDOWN_SECONDS)
                 if attempt == self.max_retries - 1:
-                    raise
-                await asyncio.sleep(self.retry_delay * (2 ** attempt))
-                logger.info(f"Retrying {provider_name} (attempt {attempt + 2}/{self.max_retries}) for model {model_name}")
-            except Exception as e:
-                logger.error(f"Unexpected error with {provider_name} for model {model_name} (attempt {attempt + 1}/{self.max_retries}): {e}", exc_info=True)
+                    raise # Re-raise the original ProviderError
+            except asyncio.TimeoutError as e:
+                logger.warning("Asyncio TimeoutError", provider_name=provider_name, model_name=model_name, attempt=attempt + 1, max_retries=self.max_retries, error=str(e))
+                self.provider_failure_counts[provider_name][model_name] += 1
+                if self.provider_failure_counts[provider_name][model_name] >= self.CIRCUIT_BREAKER_THRESHOLD:
+                    self.provider_circuit_open_until[provider_name][model_name] = datetime.utcnow() + timedelta(seconds=self.CIRCUIT_BREAKER_COOLDOWN_SECONDS)
+                    self.provider_failure_counts[provider_name][model_name] = 0
+                    logger.error("Circuit opened due to asyncio.TimeoutError", provider_name=provider_name, model_name=model_name, cooldown_seconds=self.CIRCUIT_BREAKER_COOLDOWN_SECONDS)
                 if attempt == self.max_retries - 1:
-                    # Raise as ProviderError to ensure consistent error type from this function
-                    raise ProviderError(f"Unexpected error with {provider_name} after {self.max_retries} attempts: {e}")
-                await asyncio.sleep(self.retry_delay * (2 ** attempt))
-                logger.info(f"Retrying {provider_name} (attempt {attempt + 2}/{self.max_retries}) for model {model_name} after unexpected error.")
+                     raise ProviderError(f"Asyncio TimeoutError with {provider_name}/{model_name} after {self.max_retries} attempts: {e}") from e
+            except Exception as e: # Catch-all for other unexpected errors
+                logger.error("Unexpected error during provider call",
+                               provider_name=provider_name, model_name=model_name, attempt=attempt + 1, max_retries=self.max_retries,
+                               error=str(e), exc_info=True)
+                self.provider_failure_counts[provider_name][model_name] += 1
+                if self.provider_failure_counts[provider_name][model_name] >= self.CIRCUIT_BREAKER_THRESHOLD:
+                    self.provider_circuit_open_until[provider_name][model_name] = datetime.utcnow() + timedelta(seconds=self.CIRCUIT_BREAKER_COOLDOWN_SECONDS)
+                    self.provider_failure_counts[provider_name][model_name] = 0
+                    logger.error("Circuit opened due to unexpected error", provider_name=provider_name, model_name=model_name, cooldown_seconds=self.CIRCUIT_BREAKER_COOLDOWN_SECONDS)
+                if attempt == self.max_retries - 1: # If it's the last attempt, raise it as a ProviderError
+                    raise ProviderError(f"Unexpected error with {provider_name}/{model_name} after {self.max_retries} attempts: {e}") from e
+
+            # If an error occurred and it's not the last attempt, sleep and retry
+            if attempt < self.max_retries - 1:
+                delay = self.retry_delay * (2 ** attempt)
+                logger.info("Retrying provider call after error", provider_name=provider_name, model_name=model_name, attempt=attempt + 2, max_retries=self.max_retries, delay_seconds=round(delay,2))
+                await asyncio.sleep(delay)
         
-        return None
+        return None # Should be unreachable if max_retries > 0, as errors are raised or re-raised.
     
     async def _try_provider_stream(
         self,
         provider_name: str,
         request: ChatCompletionRequest
     ) -> AsyncGenerator[ChatCompletionResponse, None]:
-        """Try streaming request with specific provider."""
-        
+        """Try streaming request with specific provider, including circuit breaker and refined error handling."""
+
         provider = self.providers.get(provider_name)
         if not provider or not provider.is_available:
+            logger.debug("_try_provider_stream: Provider not found or unavailable", provider_name=provider_name)
             return
-        
+
         # Get credentials for this provider
         credentials = await self.account_manager.get_credentials(provider_name)
         if not credentials:
-            logger.warning(f"No valid credentials for {provider_name}")
+            logger.warning("No valid credentials for provider for streaming", provider_name=provider_name, model_requested=request.model)
             return
-        
+
         # Resolve model name if "auto" is specified
-        model_name = request.model
+        model_name = request.model # Initial model name for circuit key if not "auto"
         if model_name == "auto":
-            model_name = await self._select_model(provider, request)
-            if not model_name:
-                logger.warning(f"No suitable model found for {provider_name}")
+            # Check circuit for "auto" before resolving
+            open_until_auto = self.provider_circuit_open_until[provider_name].get("auto")
+            if open_until_auto and datetime.utcnow() < open_until_auto:
+                logger.warning("Circuit for 'auto' model selection is open for streaming", provider_name=provider_name, open_until=open_until_auto.isoformat())
                 return
+
+            resolved_model_name = await self._select_model(provider, request)
+            if not resolved_model_name:
+                logger.warning("No suitable model found by _select_model for streaming", provider_name=provider_name, original_request_model=request.model)
+                self.provider_failure_counts[provider_name]["auto"] += 1
+                if self.provider_failure_counts[provider_name]["auto"] >= self.CIRCUIT_BREAKER_THRESHOLD:
+                    self.provider_circuit_open_until[provider_name]["auto"] = datetime.utcnow() + timedelta(seconds=self.CIRCUIT_BREAKER_COOLDOWN_SECONDS)
+                    self.provider_failure_counts[provider_name]["auto"] = 0
+                    logger.error("Circuit for 'auto' model selection opened for streaming", provider_name=provider_name, cooldown_seconds=self.CIRCUIT_BREAKER_COOLDOWN_SECONDS)
+                return
+            model_name = resolved_model_name # Actual model name to be used
+            logger.info("Model 'auto' resolved for streaming", provider_name=provider_name, resolved_model_name=model_name)
         
+        # Check circuit for the specific model_name (either provided or resolved from "auto")
+        open_until = self.provider_circuit_open_until[provider_name].get(model_name)
+        if open_until and datetime.utcnow() < open_until:
+            logger.warning("Circuit open for model for streaming", provider_name=provider_name, model_name=model_name, open_until=open_until.isoformat())
+            return
+
         # Create request with resolved model
         resolved_request = request.copy()
         resolved_request.model = model_name
@@ -628,18 +884,80 @@ class LLMAggregator:
             async for chunk in provider.chat_completion_stream(resolved_request, credentials):
                 yield chunk
 
-            # Update credentials usage
+            # Success: Update credentials usage and reset failure count
             await self.account_manager.update_usage(credentials)
+            self.provider_failure_counts[provider_name][model_name] = 0
+            if self.provider_circuit_open_until[provider_name].get(model_name) and \
+               self.provider_circuit_open_until[provider_name][model_name] < datetime.utcnow():
+                logger.info("Circuit closed due to successful stream", provider_name=provider_name, model_name=model_name)
+
+        except httpx.ReadTimeout as e:
+            logger.warning("ReadTimeout during stream", provider_name=provider_name, model_name=model_name, error=str(e))
+            self.provider_failure_counts[provider_name][model_name] += 1
+            if self.provider_failure_counts[provider_name][model_name] >= self.CIRCUIT_BREAKER_THRESHOLD:
+                self.provider_circuit_open_until[provider_name][model_name] = datetime.utcnow() + timedelta(seconds=self.CIRCUIT_BREAKER_COOLDOWN_SECONDS)
+                self.provider_failure_counts[provider_name][model_name] = 0
+                logger.error("Circuit opened for stream due to ReadTimeouts", provider_name=provider_name, model_name=model_name, cooldown_seconds=self.CIRCUIT_BREAKER_COOLDOWN_SECONDS)
+            raise ProviderError(f"ReadTimeout during stream with {provider_name}/{model_name}: {e}") from e
+        except httpx.ConnectError as e:
+            logger.warning("ConnectError during stream", provider_name=provider_name, model_name=model_name, error=str(e))
+            self.provider_failure_counts[provider_name][model_name] += 1
+            if self.provider_failure_counts[provider_name][model_name] >= self.CIRCUIT_BREAKER_THRESHOLD:
+                self.provider_circuit_open_until[provider_name][model_name] = datetime.utcnow() + timedelta(seconds=self.CIRCUIT_BREAKER_COOLDOWN_SECONDS)
+                self.provider_failure_counts[provider_name][model_name] = 0
+                logger.error("Circuit opened for stream due to ConnectErrors", provider_name=provider_name, model_name=model_name, cooldown_seconds=self.CIRCUIT_BREAKER_COOLDOWN_SECONDS)
+            raise ProviderError(f"ConnectError during stream with {provider_name}/{model_name}: {e}") from e
+        except httpx.HTTPStatusError as e:
+            logger.warning("HTTPStatusError during stream",
+                           provider_name=provider_name, model_name=model_name, status_code=e.response.status_code,
+                           response_text=e.response.text[:200], error=str(e))
+            self.provider_failure_counts[provider_name][model_name] += 1
+            if self.provider_failure_counts[provider_name][model_name] >= self.CIRCUIT_BREAKER_THRESHOLD:
+                self.provider_circuit_open_until[provider_name][model_name] = datetime.utcnow() + timedelta(seconds=self.CIRCUIT_BREAKER_COOLDOWN_SECONDS)
+                self.provider_failure_counts[provider_name][model_name] = 0
+                logger.error("Circuit opened for stream due to HTTPStatusErrors", provider_name=provider_name, model_name=model_name, status_code=e.response.status_code, cooldown_seconds=self.CIRCUIT_BREAKER_COOLDOWN_SECONDS)
+            raise ProviderError(f"HTTPStatusError {e.response.status_code} during stream with {provider_name}/{model_name}: {e}") from e
+        except httpx.RequestError as e:
+            logger.warning("RequestError during stream", provider_name=provider_name, model_name=model_name, error=str(e))
+            self.provider_failure_counts[provider_name][model_name] += 1
+            if self.provider_failure_counts[provider_name][model_name] >= self.CIRCUIT_BREAKER_THRESHOLD:
+                self.provider_circuit_open_until[provider_name][model_name] = datetime.utcnow() + timedelta(seconds=self.CIRCUIT_BREAKER_COOLDOWN_SECONDS)
+                self.provider_failure_counts[provider_name][model_name] = 0
+                logger.error("Circuit opened for stream due to RequestErrors", provider_name=provider_name, model_name=model_name, cooldown_seconds=self.CIRCUIT_BREAKER_COOLDOWN_SECONDS)
+            raise ProviderError(f"RequestError during stream with {provider_name}/{model_name}: {e}") from e
+
         except RateLimitError as e:
-            logger.warning(f"RateLimitError during stream with {provider_name} for model {model_name}: {e}")
-            raise  # Propagate to be handled by the caller
+            logger.warning("RateLimitError during stream, not opening circuit", provider_name=provider_name, model_name=model_name, error=str(e))
+            raise
+        except AuthenticationError as e:
+            logger.error("AuthenticationError during stream, marking credentials invalid", provider_name=provider_name, model_name=model_name, error=str(e), account_id=credentials.account_id)
+            await self.account_manager.mark_credentials_invalid(provider_name, credentials.account_id)
+            raise
         except ProviderError as e:
-            logger.warning(f"ProviderError during stream with {provider_name} for model {model_name}: {e}")
-            raise # Propagate to be handled by the caller
-        except Exception as e:
-            logger.error(f"Unexpected error during stream with {provider_name} for model {model_name}: {e}", exc_info=True)
-            # Wrap unexpected errors in ProviderError for consistent error handling
-            raise ProviderError(f"Unexpected error during stream with {provider_name} for model {model_name}: {e}")
+            logger.warning("ProviderError during stream", provider_name=provider_name, model_name=model_name, error=str(e), exc_info=True)
+            self.provider_failure_counts[provider_name][model_name] += 1
+            if self.provider_failure_counts[provider_name][model_name] >= self.CIRCUIT_BREAKER_THRESHOLD:
+                self.provider_circuit_open_until[provider_name][model_name] = datetime.utcnow() + timedelta(seconds=self.CIRCUIT_BREAKER_COOLDOWN_SECONDS)
+                self.provider_failure_counts[provider_name][model_name] = 0
+                logger.error("Circuit opened for stream due to ProviderErrors", provider_name=provider_name, model_name=model_name, cooldown_seconds=self.CIRCUIT_BREAKER_COOLDOWN_SECONDS)
+            raise
+        except asyncio.TimeoutError as e:
+            logger.warning("Asyncio TimeoutError during stream", provider_name=provider_name, model_name=model_name, error=str(e))
+            self.provider_failure_counts[provider_name][model_name] += 1
+            if self.provider_failure_counts[provider_name][model_name] >= self.CIRCUIT_BREAKER_THRESHOLD:
+                self.provider_circuit_open_until[provider_name][model_name] = datetime.utcnow() + timedelta(seconds=self.CIRCUIT_BREAKER_COOLDOWN_SECONDS)
+                self.provider_failure_counts[provider_name][model_name] = 0
+                logger.error("Circuit opened for stream due to asyncio.TimeoutError", provider_name=provider_name, model_name=model_name, cooldown_seconds=self.CIRCUIT_BREAKER_COOLDOWN_SECONDS)
+            raise ProviderError(f"Asyncio TimeoutError during stream with {provider_name}/{model_name}: {e}") from e
+        except Exception as e: # Catch-all for other unexpected errors
+            logger.error("Unexpected error during stream",
+                           provider_name=provider_name, model_name=model_name, error=str(e), exc_info=True)
+            self.provider_failure_counts[provider_name][model_name] += 1
+            if self.provider_failure_counts[provider_name][model_name] >= self.CIRCUIT_BREAKER_THRESHOLD:
+                self.provider_circuit_open_until[provider_name][model_name] = datetime.utcnow() + timedelta(seconds=self.CIRCUIT_BREAKER_COOLDOWN_SECONDS)
+                self.provider_failure_counts[provider_name][model_name] = 0
+                logger.error("Circuit opened for stream due to unexpected error", provider_name=provider_name, model_name=model_name, cooldown_seconds=self.CIRCUIT_BREAKER_COOLDOWN_SECONDS)
+            raise ProviderError(f"Unexpected error during stream with {provider_name} for model {model_name}: {e}") from e
     
     async def _select_model(
         self,
@@ -697,8 +1015,17 @@ class LLMAggregator:
         return capabilities
     
     async def list_available_models(self) -> Dict[str, List[ModelInfo]]:
-        """List all available models across providers."""
-        models_by_provider = {}
+        """
+        Lists all available models grouped by their provider.
+
+        Only models from providers that are currently marked as available
+        are included.
+
+        Returns:
+            A dictionary where keys are provider names and values are lists
+            of ModelInfo objects for that provider.
+        """
+        models_by_provider: Dict[str, List[ModelInfo]] = {}
         
         for provider_name, provider in self.providers.items():
             if provider.is_available:
@@ -707,8 +1034,17 @@ class LLMAggregator:
         return models_by_provider
     
     async def get_provider_status(self) -> Dict[str, Dict[str, Any]]:
-        """Get status of all providers."""
-        status = {}
+        """
+        Retrieves the current status of all configured providers.
+
+        This includes availability, configuration status, metrics, model counts,
+        and credential counts.
+
+        Returns:
+            A dictionary where keys are provider names and values are dictionaries
+            containing status information for that provider.
+        """
+        status: Dict[str, Dict[str, Any]] = {}
         
         for provider_name, provider in self.providers.items():
             status[provider_name] = {
@@ -722,10 +1058,19 @@ class LLMAggregator:
         return status
     
     async def health_check(self) -> Dict[str, bool]:
-        """Perform health check on all providers."""
-        results = {}
+        """
+        Performs a health check on all available providers.
+
+        This typically involves making a lightweight test call to each provider's API
+        to ensure it's responsive.
+
+        Returns:
+            A dictionary where keys are provider names and values are booleans
+            indicating whether the provider is healthy (True) or not (False).
+        """
+        results: Dict[str, bool] = {}
         
-        tasks = []
+        tasks: List[asyncio.Task] = []
         for provider_name, provider in self.providers.items():
             if provider.is_available:
                 tasks.append(self._provider_health_check(provider_name, provider))
@@ -738,26 +1083,48 @@ class LLMAggregator:
         
         return results
     
-    async def _provider_health_check(self, provider_name: str, provider: BaseProvider) -> bool:
+    async def _provider_health_check(self, provider_name: str, provider: BaseProvider) -> bool: # provider object passed for direct call
         """Perform health check on single provider."""
         try:
-            return await provider.health_check()
+            is_healthy = await provider.health_check() # This method within provider should ideally use structlog too
+            logger.info("Provider health check status", provider_name=provider_name, is_healthy=is_healthy)
+            return is_healthy
         except Exception as e:
-            logger.error(f"Health check failed for {provider_name}: {e}")
+            logger.error("Health check failed for provider", provider_name=provider_name, error=str(e), exc_info=True)
             return False
     
     async def get_meta_controller_insights(self) -> Optional[Dict[str, Any]]:
-        """Get insights from the meta-controller about model performance and selection."""
+        """
+        Retrieves insights from the meta-controller, if enabled.
+
+        This can include information about model performance, usage patterns,
+        and recommendations for model selection.
+
+        Returns:
+            A dictionary containing insights from the meta-controller, or None
+            if the meta-controller is not enabled or has no insights.
+        """
         
         if not self.meta_controller:
+            logger.debug("Meta-controller not enabled, cannot get insights.")
             return None
         
         return self.meta_controller.get_model_insights()
     
     async def get_ensemble_insights(self, request: ChatCompletionRequest) -> Optional[Dict[str, Any]]:
-        """Get insights about ensemble decision process for a given request."""
+        """
+        Retrieves insights about the ensemble decision process for a given request, if enabled.
+
+        Args:
+            request: The ChatCompletionRequest for which to get ensemble insights.
+
+        Returns:
+            A dictionary containing insights about the ensemble process, or None
+            if the ensemble system or meta-controller is not enabled.
+        """
         
         if not self.ensemble_system or not self.meta_controller:
+            logger.debug("Ensemble system or meta-controller not enabled, cannot get ensemble insights.")
             return None
         
         # Get candidate models
@@ -797,12 +1164,22 @@ class LLMAggregator:
         return self.ensemble_system.get_ensemble_insights(candidates)
     
     async def analyze_task_complexity(self, request: ChatCompletionRequest) -> Optional[Dict[str, Any]]:
-        """Analyze the complexity of a task using the meta-controller."""
+        """
+        Analyzes the complexity of a given task request using the meta-controller.
+
+        Args:
+            request: The ChatCompletionRequest to analyze.
+
+        Returns:
+            A dictionary containing various complexity scores and metrics, or None
+            if the meta-controller is not enabled.
+        """
         
-        if not self.meta_controller:
+        if not self.meta_controller or not self.meta_controller.complexity_analyzer: # Added check for complexity_analyzer
+            logger.debug("Meta-controller or complexity analyzer not enabled, cannot analyze task complexity.")
             return None
         
-        complexity = self.meta_controller.complexity_analyzer.analyze_task_complexity(request)
+        complexity = self.meta_controller.complexity_analyzer.analyze_task_complexity(request) # Assuming this is not async
         
         return {
             'reasoning_depth': complexity.reasoning_depth,
@@ -814,11 +1191,22 @@ class LLMAggregator:
             'overall_complexity': complexity.overall_complexity
         }
     
-    async def get_model_recommendations(self, request: ChatCompletionRequest) -> Dict[str, Any]:
-        """Get model recommendations for a specific request."""
+    async def get_model_recommendations(self, request: ChatCompletionRequest) -> Dict[str, Any]]:
+        """
+        Provides model recommendations for a given request.
+
+        This includes recommendations from traditional routing, meta-controller insights,
+        ensemble insights, and task complexity analysis, if available.
+
+        Args:
+            request: The ChatCompletionRequest for which to get recommendations.
+
+        Returns:
+            A dictionary containing various model recommendations and insights.
+        """
         
-        recommendations = {
-            'traditional_routing': await self._get_provider_chain(request),
+        recommendations: Dict[str, Any] = {
+            'traditional_routing_chain': await self._get_provider_chain(request), # Renamed for clarity
             'meta_controller_insights': None,
             'ensemble_insights': None,
             'task_complexity': None
@@ -848,23 +1236,37 @@ class LLMAggregator:
     async def _start_auto_updater(self):
         """Start the auto-updater background task."""
         if not self.auto_updater:
+            logger.debug("Auto-updater is not enabled, skipping start.")
             return
         
         try:
+            logger.info("Integrating and starting auto-updater...")
             # Integrate auto-updater with this aggregator
-            await integrate_auto_updater(self, self.auto_updater)
+            await integrate_auto_updater(self, self.auto_updater) # This function should also be updated if it logs
             
             # Start the auto-update loop
-            await self.auto_updater.start_auto_update(self.auto_update_interval)
+            await self.auto_updater.start_auto_update(self.auto_update_interval) # This method should also use structlog
+            logger.info("Auto-updater started.", update_interval_minutes=self.auto_update_interval)
             
         except Exception as e:
-            logger.error(f"Error in auto-updater: {e}")
+            logger.error("Error starting auto-updater", error=str(e), exc_info=True)
     
-    async def force_update_providers(self) -> Dict[str, Any]:
-        """Force an immediate update of all provider information."""
+    async def force_update_providers(self) -> Dict[str, Any]]:
+        """
+        Forces an immediate update of all provider information via the auto-updater.
+
+        This is useful for manually triggering an update outside of the scheduled interval.
+
+        Returns:
+            A dictionary containing the status of the update operation, including
+            any updates found, or an error message if the auto-updater is not enabled
+            or an error occurs.
+        """
         if not self.auto_updater:
+            logger.warning("Auto-updater not enabled, cannot force update.")
             return {"error": "Auto-updater not enabled"}
         
+        logger.info("Forcing update of all provider information.")
         try:
             updates = await self.auto_updater.force_update_all()
             
@@ -885,28 +1287,52 @@ class LLMAggregator:
             }
             
         except Exception as e:
-            logger.error(f"Error forcing provider updates: {e}")
+            logger.error("Error forcing provider updates", error=str(e), exc_info=True)
             return {"error": str(e)}
     
-    async def get_auto_update_status(self) -> Dict[str, Any]:
-        """Get the current status of the auto-updater."""
+    async def get_auto_update_status(self) -> Dict[str, Any]]:
+        """
+        Retrieves the current status of the auto-updater.
+
+        Returns:
+            A dictionary containing the auto-updater's status (e.g., enabled,
+            last update time, next update time), or an error message if an error occurs.
+            If auto-updater is not enabled, returns `{"enabled": False}`.
+        """
         if not self.auto_updater:
+            logger.debug("Auto-updater not enabled, status check returning disabled.")
             return {"enabled": False}
         
+        logger.debug("Getting auto-updater status.")
         try:
             status = await self.auto_updater.get_update_status()
             status["enabled"] = True
             return status
             
         except Exception as e:
-            logger.error(f"Error getting auto-update status: {e}")
+            logger.error("Error getting auto-update status", error=str(e), exc_info=True)
             return {"enabled": True, "error": str(e)}
     
-    async def configure_auto_updater(self, config: Dict[str, Any]) -> Dict[str, Any]:
-        """Configure auto-updater settings."""
+    async def configure_auto_updater(self, config: Dict[str, Any]) -> Dict[str, Any]]:
+        """
+        Configures settings for the auto-updater.
+
+        Allows updating parameters like the update interval or enabling/disabling
+        specific update sources.
+
+        Args:
+            config: A dictionary containing configuration options to apply.
+                    Expected keys might include 'update_interval' (int, minutes)
+                    or 'sources' (list of source configurations).
+
+        Returns:
+            A dictionary indicating the success or failure of the configuration update.
+        """
         if not self.auto_updater:
+            logger.warning("Auto-updater not enabled, cannot configure.")
             return {"error": "Auto-updater not enabled"}
         
+        logger.info("Configuring auto-updater.", new_config=config)
         try:
             # Update interval
             if "update_interval" in config:
@@ -931,14 +1357,28 @@ class LLMAggregator:
             return {"status": "success", "message": "Auto-updater configuration updated"}
             
         except Exception as e:
-            logger.error(f"Error configuring auto-updater: {e}")
+            logger.error("Error configuring auto-updater", config_options=config, error=str(e), exc_info=True)
             return {"error": str(e)}
     
-    async def get_provider_updates_history(self, provider_name: str = None) -> Dict[str, Any]:
-        """Get history of provider updates."""
+    async def get_provider_updates_history(self, provider_name: Optional[str] = None) -> Dict[str, Any]]:
+        """
+        Retrieves the history of provider updates from the auto-updater.
+
+        This typically shows cached information about models and when they were last updated.
+        This method's utility depends on the auto-updater's caching implementation.
+
+        Args:
+            provider_name: Optional. If provided, filters history for a specific provider.
+
+        Returns:
+            A dictionary containing update history information, or an error message
+            if the auto-updater is not enabled or an error occurs.
+        """
         if not self.auto_updater:
+            logger.warning("Auto-updater not enabled, cannot get update history.")
             return {"error": "Auto-updater not enabled"}
         
+        logger.debug("Getting provider updates history.", provider_filter=provider_name)
         try:
             # This would require storing update history
             # For now, return cached data
@@ -965,13 +1405,20 @@ class LLMAggregator:
                 return {"providers": summary}
                 
         except Exception as e:
-            logger.error(f"Error getting provider updates history: {e}")
+            logger.error("Error getting provider updates history", provider_name_filter=provider_name, error=str(e), exc_info=True)
             return {"error": str(e)}
     
-    async def close(self):
-        """Close all providers and cleanup resources."""
-        tasks = []
-        for provider in self.providers.values():
+    async def close(self) -> None:
+        """
+        Closes all provider connections and cleans up resources.
+
+        This method should be called during application shutdown to ensure graceful
+        termination of provider clients and any background tasks like the auto-updater.
+        """
+        logger.info("Closing LLM Aggregator and its components...")
+        tasks: List[asyncio.Task] = []
+        for provider_name, provider in self.providers.items(): # Iterate with name for logging
+            logger.debug("Adding provider to close queue", provider_name=provider_name)
             tasks.append(provider.close())
         
         if tasks:
@@ -979,6 +1426,6 @@ class LLMAggregator:
         
         # Close auto-updater
         if self.auto_updater:
-            await self.auto_updater.close()
+            await self.auto_updater.close() # This method should also use structlog
         
-        logger.info("LLM Aggregator closed")
+        logger.info("LLM Aggregator closed successfully.")

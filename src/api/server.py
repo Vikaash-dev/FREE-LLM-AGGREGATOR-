@@ -2,8 +2,12 @@
 FastAPI server for the LLM API Aggregator.
 """
 
+# Initialize logging early
+from src.config.logging_config import setup_logging
+setup_logging()
+
 import asyncio
-import logging
+import structlog # Changed from logging
 import time
 import os
 from contextlib import asynccontextmanager
@@ -16,6 +20,8 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import uvicorn
 
 from src.config import settings # Centralized settings
+# Ensure setup_logging is called before any loggers are instantiated by other modules if they also use structlog.
+# For stdlib logging, structlog's configuration will take over.
 
 from ..models import (
     ChatCompletionRequest,
@@ -33,14 +39,14 @@ from ..providers.groq import create_groq_provider
 from ..providers.cerebras import create_cerebras_provider
 
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__) # Changed from logging
 security = HTTPBearer(auto_error=False)
 
 # Security configuration using centralized settings
 # ADMIN_TOKEN and ALLOWED_ORIGINS are now accessed via settings object
 
 if not settings.ADMIN_TOKEN:
-    logger.warning("ADMIN_TOKEN not set in environment or .env file. Admin endpoints will be disabled if called.")
+    logger.warning("ADMIN_TOKEN not set. Admin endpoints may be disabled if called.", admin_token_present=False)
 
 # Global aggregator instance
 aggregator: Optional[LLMAggregator] = None
@@ -52,9 +58,10 @@ async def lifespan(app: FastAPI):
     global aggregator
     
     # Startup
-    logger.info("Starting LLM API Aggregator...")
+    logger.info("Starting LLM API Aggregator server...") # Changed message slightly for clarity
     
     # Initialize components
+    # AccountManager will now use OPENHANDS_ENCRYPTION_KEY from settings
     account_manager = AccountManager()
     rate_limiter = RateLimiter()
     
@@ -82,15 +89,15 @@ async def lifespan(app: FastAPI):
         rate_limiter=rate_limiter
     )
     
-    logger.info("LLM API Aggregator started successfully")
+    logger.info("LLM API Aggregator started successfully.") # Added a period
     
     yield
     
     # Shutdown
-    logger.info("Shutting down LLM API Aggregator...")
+    logger.info("Shutting down LLM API Aggregator server...") # Changed message slightly for clarity
     if aggregator:
-        await aggregator.close()
-    logger.info("LLM API Aggregator shut down")
+        await aggregator.close() # This close method should also use structlog if it logs
+    logger.info("LLM API Aggregator shut down successfully.") # Added a period
 
 
 # Create FastAPI app
@@ -118,13 +125,14 @@ def get_user_id(credentials: HTTPAuthorizationCredentials = Depends(security)) -
     return None
 
 
-async def verify_admin_token(credentials: HTTPAuthorizationCredentials = Depends(security)) -> str:
+async def verify_admin_token(request: Request, credentials: HTTPAuthorizationCredentials = Depends(security)) -> str:
     """Verify admin token for admin endpoints."""
     if not settings.ADMIN_TOKEN:
-        logger.error("Attempt to access admin endpoint, but ADMIN_TOKEN is not configured.")
+        logger.error("Admin token not configured", endpoint=str(request.url), admin_token_present=False)
         raise HTTPException(status_code=503, detail="Admin functionality is not configured or disabled.")
     
     if not credentials or credentials.credentials != settings.ADMIN_TOKEN:
+        logger.warning("Invalid admin token received", endpoint=str(request.url), client_host=request.client.host if request.client else "unknown")
         raise HTTPException(status_code=401, detail="Invalid admin token")
     
     return credentials.credentials
@@ -185,17 +193,19 @@ async def chat_completions(
             return response
             
     except RateLimitExceeded as e:
+        logger.warning("Rate limit exceeded for chat completion", user_id=user_id, error=str(e), request_model=request.model)
         raise HTTPException(status_code=429, detail=str(e))
     except Exception as e:
-        logger.error(f"Chat completion error: {e}")
+        logger.error("Chat completion error", error=str(e), user_id=user_id, request_model=request.model, exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/v1/models")
-async def list_models():
+async def list_models(request_obj: Request): # Added Request for logging context
     """List available models across all providers."""
     
     if not aggregator:
+        logger.warning("List models endpoint called but aggregator not ready", endpoint=str(request_obj.url))
         raise HTTPException(status_code=503, detail="Service not ready")
     
     try:
@@ -222,25 +232,29 @@ async def list_models():
         return {"object": "list", "data": models}
         
     except Exception as e:
-        logger.error(f"List models error: {e}")
+        logger.error("List models error", error=str(e), endpoint=str(request_obj.url), exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/admin/credentials")
 async def add_credentials(
+    request_obj: Request, # Added Request for logging context
     provider: str,
     account_id: str,
-    api_key: str,
+    api_key: str, # Consider not logging API key directly, even its presence
     additional_headers: Optional[Dict[str, str]] = None,
     _admin_token: str = Depends(verify_admin_token)
 ):
     """Add API credentials for a provider."""
     
     if not aggregator:
+        logger.warning("Add credentials endpoint called but aggregator not ready", endpoint=str(request_obj.url))
         raise HTTPException(status_code=503, detail="Service not ready")
     
     try:
-        credentials = await aggregator.account_manager.add_credentials(
+        # Note: API key itself is not logged for security, but its presence could be if needed.
+        logger.info("Attempting to add credentials", provider=provider, account_id=account_id, has_additional_headers=bool(additional_headers), admin_user=_admin_token) # Assuming admin_token is username or similar
+        created_credentials = await aggregator.account_manager.add_credentials(
             provider=provider,
             account_id=account_id,
             api_key=api_key,
@@ -248,94 +262,106 @@ async def add_credentials(
         )
         
         return {
-            "message": f"Credentials added for {provider}:{account_id}",
+            "message": f"Credentials successfully added for {provider}:{account_id}", # Added "successfully"
             "provider": provider,
             "account_id": account_id
         }
         
     except Exception as e:
-        logger.error(f"Add credentials error: {e}")
+        logger.error("Add credentials error", error=str(e), provider=provider, account_id=account_id, admin_user=_admin_token, exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/admin/credentials")
-async def list_credentials(_admin_token: str = Depends(verify_admin_token)):
+async def list_credentials(request_obj: Request, _admin_token: str = Depends(verify_admin_token)): # Added Request
     """List all credentials (without sensitive data)."""
     
     if not aggregator:
+        logger.warning("List credentials endpoint called but aggregator not ready", endpoint=str(request_obj.url), admin_user=_admin_token)
         raise HTTPException(status_code=503, detail="Service not ready")
     
     try:
-        credentials = await aggregator.account_manager.list_credentials()
-        return credentials
+        logger.info("Listing credentials", admin_user=_admin_token)
+        credentials_list = await aggregator.account_manager.list_credentials()
+        return credentials_list
         
     except Exception as e:
-        logger.error(f"List credentials error: {e}")
+        logger.error("List credentials error", error=str(e), admin_user=_admin_token, exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.delete("/admin/credentials/{provider}/{account_id}")
-async def remove_credentials(provider: str, account_id: str, _admin_token: str = Depends(verify_admin_token)):
+async def remove_credentials(request_obj: Request, provider: str, account_id: str, _admin_token: str = Depends(verify_admin_token)): # Added Request
     """Remove credentials for a specific account."""
     
     if not aggregator:
+        logger.warning("Remove credentials endpoint called but aggregator not ready", endpoint=str(request_obj.url), admin_user=_admin_token)
         raise HTTPException(status_code=503, detail="Service not ready")
     
     try:
+        logger.info("Attempting to remove credentials", provider=provider, account_id=account_id, admin_user=_admin_token)
         removed = await aggregator.account_manager.remove_credentials(provider, account_id)
         
         if removed:
+            logger.info("Successfully removed credentials", provider=provider, account_id=account_id, admin_user=_admin_token)
             return {"message": f"Credentials removed for {provider}:{account_id}"}
         else:
+            logger.warning("Credentials not found for removal", provider=provider, account_id=account_id, admin_user=_admin_token)
             raise HTTPException(status_code=404, detail="Credentials not found")
             
-    except HTTPException:
+    except HTTPException: # Re-raise HTTPException directly to preserve its details
         raise
     except Exception as e:
-        logger.error(f"Remove credentials error: {e}")
+        logger.error("Remove credentials error", error=str(e), provider=provider, account_id=account_id, admin_user=_admin_token, exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/admin/providers")
-async def get_provider_status(_admin_token: str = Depends(verify_admin_token)):
+async def get_provider_status(request_obj: Request, _admin_token: str = Depends(verify_admin_token)): # Added Request
     """Get status of all providers."""
     
     if not aggregator:
+        logger.warning("Get provider status endpoint called but aggregator not ready", endpoint=str(request_obj.url), admin_user=_admin_token)
         raise HTTPException(status_code=503, detail="Service not ready")
     
     try:
-        status = await aggregator.get_provider_status()
-        return status
+        logger.info("Getting provider status", admin_user=_admin_token)
+        status_info = await aggregator.get_provider_status()
+        return status_info
         
     except Exception as e:
-        logger.error(f"Get provider status error: {e}")
+        logger.error("Get provider status error", error=str(e), admin_user=_admin_token, exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/admin/rate-limits")
-async def get_rate_limit_status(user_id: Optional[str] = Depends(get_user_id), _admin_token: str = Depends(verify_admin_token)):
+async def get_rate_limit_status(request_obj: Request, user_id: Optional[str] = Depends(get_user_id), _admin_token: str = Depends(verify_admin_token)): # Added Request
     """Get rate limit status."""
     
     if not aggregator:
+        logger.warning("Get rate limit status endpoint called but aggregator not ready", endpoint=str(request_obj.url), admin_user=_admin_token)
         raise HTTPException(status_code=503, detail="Service not ready")
     
     try:
-        status = aggregator.rate_limiter.get_rate_limit_status(user_id)
-        return status
+        logger.info("Getting rate limit status", user_id_param=user_id, admin_user=_admin_token) # Renamed user_id to avoid conflict
+        status_info = aggregator.rate_limiter.get_rate_limit_status(user_id)
+        return status_info
         
     except Exception as e:
-        logger.error(f"Get rate limit status error: {e}")
+        logger.error("Get rate limit status error", error=str(e), user_id_param=user_id, admin_user=_admin_token, exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/admin/usage-stats")
-async def get_usage_stats(_admin_token: str = Depends(verify_admin_token)):
+async def get_usage_stats(request_obj: Request, _admin_token: str = Depends(verify_admin_token)): # Added Request
     """Get usage statistics."""
     
     if not aggregator:
+        logger.warning("Get usage stats endpoint called but aggregator not ready", endpoint=str(request_obj.url), admin_user=_admin_token)
         raise HTTPException(status_code=503, detail="Service not ready")
     
     try:
+        logger.info("Getting usage statistics", admin_user=_admin_token)
         # Get account usage stats
         account_stats = await aggregator.account_manager.get_usage_stats()
         
@@ -353,23 +379,26 @@ async def get_usage_stats(_admin_token: str = Depends(verify_admin_token)):
         }
         
     except Exception as e:
-        logger.error(f"Get usage stats error: {e}")
+        logger.error("Get usage stats error", error=str(e), admin_user=_admin_token, exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/admin/rotate-credentials/{provider}")
-async def rotate_credentials(provider: str, _admin_token: str = Depends(verify_admin_token)):
+async def rotate_credentials(request_obj: Request, provider: str, _admin_token: str = Depends(verify_admin_token)): # Added Request
     """Rotate credentials for a provider."""
     
     if not aggregator:
+        logger.warning("Rotate credentials endpoint called but aggregator not ready", endpoint=str(request_obj.url), admin_user=_admin_token)
         raise HTTPException(status_code=503, detail="Service not ready")
     
     try:
+        logger.info("Attempting to rotate credentials", provider=provider, admin_user=_admin_token)
         await aggregator.account_manager.rotate_credentials(provider)
+        logger.info("Successfully rotated credentials", provider=provider, admin_user=_admin_token)
         return {"message": f"Credentials rotated for {provider}"}
         
     except Exception as e:
-        logger.error(f"Rotate credentials error: {e}")
+        logger.error("Rotate credentials error", error=str(e), provider=provider, admin_user=_admin_token, exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -380,16 +409,22 @@ def create_app() -> FastAPI:
 
 def run_server(host: str = "0.0.0.0", port: int = 8000, reload: bool = False):
     """Run the server."""
+    # Uvicorn will use the structured logging if setup_logging() configures the root logger effectively.
+    # The log_level here for uvicorn itself might be separate from application log level set by structlog.
+    # structlog's setup should handle the application's log level.
     uvicorn.run(
-        "src.api.server:app",
+        "src.api.server:app", # app object should be recognized
         host=host,
         port=port,
         reload=reload,
-        log_level=settings.LOG_LEVEL.lower() # Use settings for log level
+        log_level=settings.LOG_LEVEL.lower()
+        # Consider uvicorn's own logging configuration if more control over server logs vs app logs is needed.
+        # For now, structlog setup is global.
     )
 
 
 if __name__ == "__main__":
-    # Basic logging configuration for startup messages
-    logging.basicConfig(level=settings.LOG_LEVEL.upper())
+    # setup_logging() is called at the top of the file, so basicConfig is no longer needed here.
+    # logging.basicConfig(level=settings.LOG_LEVEL.upper()) # Removed
+    logger.info("Starting server directly via __main__.")
     run_server()
