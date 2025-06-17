@@ -1,8 +1,39 @@
-Documentation Update Required:
-- Explain in README.md or SECURITY.md that credentials should now be primarily managed via environment variables.
-- Provide the naming convention:
-    - `OPENHANDS_ENCRYPTION_KEY` for the master encryption key.
-    - `OPENHANDS_PROVIDER_{PROVIDER_NAME}_ACCOUNT_{ACCOUNT_ID}_API_KEY` for API keys.
-    - `OPENHANDS_PROVIDER_{PROVIDER_NAME}_ACCOUNT_{ACCOUNT_ID}_ADDITIONAL_HEADERS` (JSON string) for any additional headers.
-- Mention that `credentials.json` is deprecated and will be removed. If used, `OPENHANDS_ENCRYPTION_KEY` must be set for it to be decryptable across sessions.
-- Strongly advise setting `OPENHANDS_ENCRYPTION_KEY` in production.
+## Documentation Updates for Advanced Research & Python Code Generation
+
+The following updates should be incorporated into `README.md` or a new `FEATURES.md` file:
+
+### New Dependencies:
+- `httpx`: For making asynchronous HTTP requests (used by WebResearcher).
+- `beautifulsoup4`: For parsing HTML content (used by WebResearcher).
+Ensure these are listed in `requirements.txt`.
+
+### Enhanced Research Capabilities:
+- **Live Web Research (`WebResearcher`):**
+  - The system can now perform basic live web searches (currently by constructing Google search URLs) to find relevant URLs.
+  - It can fetch content from these URLs and parse HTML to extract textual information using `BeautifulSoup`.
+  - **Limitations:**
+    - Direct Google search URL construction and parsing is fragile and may be blocked or yield inconsistent results. A proper Search API key (e.g., Google Custom Search JSON API, SerpApi) is recommended for robust production use but is not integrated by default to keep setup simple.
+    - JavaScript-rendered content may not be fully captured as it relies on static HTML parsing.
+- **Relevance Scoring (`RelevanceScorer`):**
+  - Fetched web content is scored for relevance against the research task using an LLM.
+- **Keyword Extraction & Synthesis:**
+  - These features (from Phase 2, Steps 3 & 6) remain, now operating on potentially live web data.
+
+### Enhanced Python Code Generation (`MultiLanguageCodeGenerator`):
+- **LLM-Based Generation:** Python code is generated using an LLM based on detailed specifications.
+- **Basic Code Analysis (`PythonAnalyzer`):**
+  - Generated Python code undergoes a basic structural analysis using Python's `ast` module.
+  - Information extracted includes imports, top-level functions (names, args, docstring presence), and classes (names, methods, docstring presence). This analysis is currently for reporting/logging.
+- **Basic Code Quality Checking (`CodeQualityChecker`):**
+  - Custom checks are performed on generated Python code:
+    - Detection of "TODO" / "FIXME" comments.
+    - Lines exceeding a configured maximum length (default 100).
+    - Basic check for docstring presence in functions, classes, and methods (using AST analysis results).
+  - A naive quality score and a list of issues are reported in the `CodeGenerationResult`.
+- **Limitations:**
+  - Code analysis and quality checking are basic and do not replace comprehensive linting or static analysis tools.
+  - The system does not yet use analysis/quality feedback for iterative code refinement with the LLM.
+  - Support for languages other than Python in `MultiLanguageCodeGenerator` is still pending.
+
+### Simulation Script:
+- `run_planning_simulation.py` has been updated to demonstrate these new live research and enhanced Python code generation capabilities. Note that live web requests can make the simulation slower and dependent on network connectivity.

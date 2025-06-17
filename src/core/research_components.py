@@ -1,6 +1,8 @@
 import structlog
 from typing import List, Dict, Any, Optional
 import json
+import httpx # Import httpx
+from bs4 import BeautifulSoup # Import BeautifulSoup
 
 # Assuming LLMAggregator and related models are imported correctly if not already
 from ..aggregator import LLMAggregator # If it's in src/core/aggregator.py
@@ -97,107 +99,134 @@ class ContextualKeywordExtractor:
 
 class WebResearcher:
     '''
-    Performs web searches (mocked in early Phase 2) and fetches content.
+    Performs web searches using HTTP requests and parses content.
     '''
-    def __init__(self):
-        # Define a simple mock database of web content
-        # Keys are identifiers, values are tuples of (title, content_snippet, full_content)
-        # Keywords can be associated with these identifiers for mock searching.
-        self.mock_web_content_db: Dict[str, Dict[str, Any]] = { # Allow Any for "keywords" list
-            "mock_page_python_basics": {
-                "title": "Python Basics for Beginners",
-                "snippet": "Learn the fundamental concepts of Python programming...",
-                "full_content": "This is a detailed document about Python basics. It covers variables, data types, loops, and functions. Suitable for beginners.",
-                "keywords": ["python basics", "learn python", "python tutorial"]
-            },
-            "mock_page_async_python": {
-                "title": "Asynchronous Programming in Python",
-                "snippet": "An introduction to asyncio, async/await keywords...",
-                "full_content": "Detailed guide on asynchronous programming in Python using asyncio. Discusses event loops, coroutines, async and await. For intermediate users.",
-                "keywords": ["python asyncio", "async python", "python concurrency"]
-            },
-            "mock_page_fastapi_intro": {
-                "title": "Introduction to FastAPI",
-                "snippet": "Build fast APIs with Python 3.7+ based on standard Python type hints...",
-                "full_content": "FastAPI is a modern, fast (high-performance) web framework for building APIs with Python. This document provides an introduction and a simple tutorial.",
-                "keywords": ["fastapi tutorial", "python web framework", "fastapi basics"]
-            },
-            "mock_page_rust_ownership": {
-                "title": "Understanding Ownership in Rust",
-                "snippet": "Rust's ownership system is its most unique feature...",
-                "full_content": "Ownership is a set of rules that governs how a Rust program manages memory. This page explains the concepts of ownership, borrowing, and slices.",
-                "keywords": ["rust ownership", "rust memory management", "learn rust"]
-            }
+    def __init__(self, http_client: Optional[httpx.AsyncClient] = None):
+        # If an http_client is provided, use it, otherwise create a new one.
+        # This allows for sharing a client in a larger application context if needed.
+        self.http_client = http_client if http_client else httpx.AsyncClient(timeout=10.0, follow_redirects=True)
+        # Basic headers to mimic a browser, can be expanded
+        self.headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
         }
-        logger.info("WebResearcher initialized (using mock content database).")
+        logger.info("WebResearcher initialized (for live web fetching).")
 
-    async def search(self, keywords: List[str]) -> List[SearchResult]:
+    async def search(self, keywords: List[str], max_results_per_keyword: int = 3) -> List[SearchResult]:
         '''
-        Simulates finding relevant mock content based on keywords.
-        Does NOT perform live web searches in this version.
+        Performs a basic web search by constructing a Google search URL and parsing results.
+        This is a simplified implementation and may be fragile due to changes in
+        search engine HTML structure or anti-scraping measures.
 
         Args:
-            keywords: A list of keywords to "search" for.
+            keywords: A list of keywords to search for.
+            max_results_per_keyword: Max results to try to extract for each keyword.
 
         Returns:
-            A list of SearchResult objects linking keywords to mock content identifiers.
+            A list of SearchResult objects containing URLs.
         '''
-        logger.info("Performing mock search", keywords=keywords)
-        found_results: List[SearchResult] = []
-        # Keep track of added identifiers to avoid duplicates for different keywords
-        # pointing to the same mock page.
-        added_identifiers = set()
+        logger.info("Performing live web search", keywords=keywords)
+        all_search_results: List[SearchResult] = []
+        unique_urls = set()
 
         if not keywords:
-            logger.warn("No keywords provided for mock search.")
+            logger.warn("No keywords provided for live search.")
             return []
 
         for keyword in keywords:
-            kw_lower = keyword.lower()
-            for identifier, data in self.mock_web_content_db.items():
-                if identifier not in added_identifiers:
-                    # Check if keyword is in the page's associated keywords or title
-                    page_keywords_lower = [pk.lower() for pk in data.get("keywords", [])]
-                    title_lower = data.get("title", "").lower()
-                    content_snippet_lower = data.get("snippet", "").lower() # Check snippet too
+            search_url = f"https://www.google.com/search?q={httpx.utils.quote(keyword)}"
+            logger.debug("Constructed search URL", url=search_url, keyword=keyword)
 
-                    if kw_lower in page_keywords_lower or kw_lower in title_lower or kw_lower in content_snippet_lower:
-                        found_results.append(SearchResult(
-                            source_identifier=identifier,
-                            matched_keyword=keyword,
-                            title=data.get("title"),
-                            snippet=data.get("snippet")
-                        ))
-                        added_identifiers.add(identifier)
-                        # Limit to one match per mock page for simplicity in this mock search
-                        # In a real search, a page might match multiple query keywords.
+            try:
+                response = await self.http_client.get(search_url, headers=self.headers)
+                response.raise_for_status() # Raise an exception for bad status codes
 
-        logger.info("Mock search complete", num_results_found=len(found_results), keywords=keywords)
-        return found_results
+                soup = BeautifulSoup(response.text, 'html.parser')
 
-    async def _fetch_mock_content(self, identifier: str) -> Optional[str]:
+                found_count_for_keyword = 0
+                for link_tag in soup.find_all('a'):
+                    href = link_tag.get('href')
+                    if href and href.startswith('/url?q='): # Google's redirect links
+                        actual_url = href.split('/url?q=')[1].split('&sa=')[0]
+                        if actual_url.startswith('http') and actual_url not in unique_urls:
+                            title_tag = link_tag.find('h3')
+                            title = title_tag.get_text() if title_tag else "No title found"
+
+                            snippet = ""
+                            snippet_tag_parent = link_tag.find_parent()
+                            if snippet_tag_parent:
+                                snippet_div = snippet_tag_parent.find_next_sibling('div')
+                                if snippet_div:
+                                    span_with_snippet_like_text = snippet_div.find('span', recursive=True)
+                                    if span_with_snippet_like_text:
+                                        snippet = span_with_snippet_like_text.get_text(separator=' ', strip=True)
+
+                            all_search_results.append(SearchResult(
+                                source_identifier=actual_url,
+                                matched_keyword=keyword,
+                                title=title,
+                                snippet=snippet[:200] if snippet else None # Truncate snippet
+                            ))
+                            unique_urls.add(actual_url)
+                            found_count_for_keyword += 1
+                            if found_count_for_keyword >= max_results_per_keyword:
+                                break
+                logger.info("Parsed search results for keyword", keyword=keyword, count=found_count_for_keyword)
+
+            except httpx.HTTPStatusError as e:
+                logger.error("HTTP error during live search", keyword=keyword, url=e.request.url, status_code=e.response.status_code, exc_info=False)
+            except httpx.RequestError as e:
+                logger.error("Request error during live search", keyword=keyword, url=e.request.url, error=str(e), exc_info=True)
+            except Exception as e:
+                logger.error("Unexpected error during live search parsing", keyword=keyword, error=str(e), exc_info=True)
+
+        logger.info("Live web search complete", total_results_found=len(all_search_results))
+        return all_search_results
+
+    async def fetch_and_parse_live_content(self, url: str) -> Optional[str]:
         '''
-        Retrieves the full content for a given mock content identifier.
+        Fetches content from a live URL and parses it to extract clean text.
 
         Args:
-            identifier: The ID of the mock content to retrieve.
+            url: The URL to fetch and parse.
 
         Returns:
-            The full content string, or None if the identifier is not found.
+            Cleaned textual content as a string, or None if fetching/parsing fails.
         '''
-        logger.debug("Fetching mock content", identifier=identifier)
-        page_data = self.mock_web_content_db.get(identifier)
-        if page_data:
-            content = page_data.get("full_content")
-            if content:
-                logger.info("Mock content fetched successfully", identifier=identifier, content_length=len(content))
-                return content
-            else:
-                logger.warn("Mock content found for identifier, but 'full_content' is missing.", identifier=identifier)
+        logger.info("Fetching live content", url=url)
+        try:
+            response = await self.http_client.get(url, headers=self.headers)
+            response.raise_for_status()
+
+            content_type = response.headers.get("content-type", "").lower()
+            if not ("html" in content_type or "text" in content_type):
+                logger.warn("Skipping non-HTML/text content", url=url, content_type=content_type)
                 return None
-        else:
-            logger.warn("Mock content identifier not found in database.", identifier=identifier)
-            return None
+
+            soup = BeautifulSoup(response.text, 'html.parser')
+
+            for script_or_style in soup(["script", "style", "header", "footer", "nav", "aside"]):
+                script_or_style.decompose()
+
+            text = soup.get_text(separator='\n', strip=True)
+            text = "\n".join([line.strip() for line in text.splitlines() if line.strip()])
+
+            logger.info("Live content fetched and parsed successfully", url=url, content_length=len(text))
+            return text
+
+        except httpx.HTTPStatusError as e:
+            logger.error("HTTP error fetching live content", url=e.request.url, status_code=e.response.status_code, exc_info=False)
+        except httpx.RequestError as e:
+            logger.error("Request error fetching live content", url=e.request.url, error=str(e), exc_info=True)
+        except Exception as e:
+            logger.error("Unexpected error fetching/parsing live content", url=url, error=str(e), exc_info=True)
+
+        return None
+
+    async def close_client(self):
+        '''Closes the httpx.AsyncClient. Should be called on application shutdown.'''
+        if self.http_client:
+            await self.http_client.aclose()
+            logger.info("WebResearcher's HTTP client closed.")
 
 class RelevanceScorer:
     '''
@@ -227,20 +256,24 @@ class RelevanceScorer:
             return []
 
         for s_result in search_results:
-            logger.debug("Processing search result for scoring", source_identifier=s_result.source_identifier, matched_keyword=s_result.matched_keyword)
-            # Use the passed web_researcher instance to fetch content
-            fetched_content = await web_researcher._fetch_mock_content(s_result.source_identifier)
+            logger.debug("Processing search result for scoring", source_url=s_result.source_identifier, title=s_result.title)
 
+            # Use the new live content fetching method from WebResearcher
+            fetched_content = await web_researcher.fetch_and_parse_live_content(s_result.source_identifier)
+
+            error_fetching_message: Optional[str] = None
             if fetched_content is None:
-                logger.warn("Failed to fetch content for scoring", source_identifier=s_result.source_identifier)
+                logger.warn("Failed to fetch or parse live content for scoring", source_url=s_result.source_identifier)
+                error_fetching_message = "Content fetching/parsing failed or content type not supported."
+                # Create a ProcessedResult indicating failure for this item
                 processed_results.append(ProcessedResult(
                     original_search_result=s_result,
-                    fetched_content="",
+                    fetched_content="", # No content fetched
                     relevance_score=0.0,
-                    relevance_justification="Failed to fetch content.",
-                    error_fetching="Content not found or fetch error."
+                    relevance_justification="Could not retrieve or parse content for relevance assessment.",
+                    error_fetching=error_fetching_message
                 ))
-                continue
+                continue # Move to the next search result
 
             # Truncate fetched_content if too long for the prompt to avoid excessive token usage
             max_content_words = 1500
@@ -257,7 +290,7 @@ class RelevanceScorer:
             Task Description:
             "{task_description}"
 
-            Text Content to Evaluate (from source: {s_result.source_identifier}, title: {s_result.title}):
+            Text Content to Evaluate (from URL: {s_result.source_identifier}):
             --- BEGIN CONTENT ---
             {truncated_content}
             --- END CONTENT ---
@@ -285,40 +318,41 @@ class RelevanceScorer:
             current_justification = "LLM scoring failed or produced invalid output."
 
             try:
-                logger.debug("Sending relevance scoring request to LLM", source_identifier=s_result.source_identifier)
+                logger.debug("Sending relevance scoring request to LLM for live content", source_url=s_result.source_identifier)
                 response = await self.llm_aggregator.chat_completion(request)
 
                 if response.choices and response.choices[0].message and response.choices[0].message.content:
                     llm_score_json_str = response.choices[0].message.content.strip()
-                    logger.debug("Received LLM response for relevance scoring", llm_response_content_length=len(llm_score_json_str), source_identifier=s_result.source_identifier)
+                    logger.debug("Received LLM response for relevance scoring", llm_response_content_length=len(llm_score_json_str), source_url=s_result.source_identifier)
 
                     if llm_score_json_str.startswith("```json"):
-                        llm_score_json_str = llm_score_json_str[len("```json"):]
+                        llm_score_json_str = llm_score_json_str[len("```json"):] # Corrected length
                     if llm_score_json_str.endswith("```"):
-                        llm_score_json_str = llm_score_json_str[:-len("```")]
+                        llm_score_json_str = llm_score_json_str[:-len("```")] # Corrected length
 
                     score_data = json.loads(llm_score_json_str)
                     current_score = float(score_data.get("relevance_score", 0.0))
                     current_justification = score_data.get("justification", "No justification provided by LLM.")
-                    logger.info("Successfully scored relevance", source_identifier=s_result.source_identifier, score=current_score)
+                    logger.info("Successfully scored relevance for live content", source_url=s_result.source_identifier, score=current_score)
                 else:
-                    logger.warn("LLM response for relevance scoring was empty or malformed.", source_identifier=s_result.source_identifier, llm_response_obj=response.model_dump_json() if response else None)
+                    logger.warn("LLM response for relevance scoring (live content) was empty or malformed.", source_url=s_result.source_identifier, llm_response_obj=response.model_dump_json() if response else None)
 
             except json.JSONDecodeError as e:
-                logger.error("Failed to decode JSON from LLM response for relevance scoring",
-                             error=str(e), raw_response_snippet=llm_score_json_str[:200] if llm_score_json_str else "None", source_identifier=s_result.source_identifier)
-            except ValueError as e: # Handles float conversion error
-                logger.error("Failed to convert relevance_score to float from LLM response",
-                             error=str(e), raw_response_snippet=llm_score_json_str[:200] if llm_score_json_str else "None", source_identifier=s_result.source_identifier)
+                logger.error("Failed to decode JSON from LLM for relevance scoring (live content)",
+                             error=str(e), raw_response_snippet=llm_score_json_str[:200] if llm_score_json_str else "None", source_url=s_result.source_identifier)
+            except ValueError as e:
+                logger.error("Failed to convert relevance_score to float from LLM (live content)",
+                             error=str(e), raw_response_snippet=llm_score_json_str[:200] if llm_score_json_str else "None", source_url=s_result.source_identifier)
             except Exception as e:
-                logger.error("Error during LLM call for relevance scoring", error=str(e), source_identifier=s_result.source_identifier, exc_info=True)
+                logger.error("Error during LLM call for relevance scoring (live content)", error=str(e), source_url=s_result.source_identifier, exc_info=True)
 
             processed_results.append(ProcessedResult(
                 original_search_result=s_result,
-                fetched_content=fetched_content, # Store original full content, not truncated
+                fetched_content=fetched_content, # Store original full fetched content
                 relevance_score=current_score,
-                relevance_justification=current_justification
+                relevance_justification=current_justification,
+                error_fetching=None # Null if content was successfully passed to LLM
             ))
 
-        logger.info("Relevance scoring complete for all results.", num_processed=len(processed_results), num_originally_found=len(search_results))
+        logger.info("Relevance scoring complete for all live results.", num_processed=len(processed_results), num_originally_found=len(search_results))
         return processed_results
