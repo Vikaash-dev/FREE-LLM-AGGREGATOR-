@@ -14,24 +14,35 @@ class TaskType(Enum):
     SECURITY_AUDIT = "security_audit"
     PERFORMANCE_OPTIMIZATION = "performance_optimization"
     RESEARCH_INTEGRATION = "research_integration"
-    UNKNOWN = "unknown" # Added for default case
+    # New/Refined Task Types
+    COMPLEX_REASONING = "complex_reasoning" # For tasks requiring multi-step thought
+    KNOWLEDGE_LOOKUP = "knowledge_lookup"   # For tasks requiring factual/external data
+    PLANNING = "planning"                 # For tasks that need a sequence of actions defined
+    UNKNOWN = "unknown"
 
 class TaskComplexity(Enum):
     SIMPLE = "simple"
     MODERATE = "moderate"
     COMPLEX = "complex"
     EXPERT = "expert"
+    # Potentially add more granular complexities if needed later
+    REQUIRES_DEEP_REASONING = "requires_deep_reasoning"
+    REQUIRES_KNOWLEDGE_GRAPH = "requires_knowledge_graph"
 
 @dataclass
 class TaskAnalysis:
     task_type: TaskType
-    complexity: TaskComplexity
+    complexity: TaskComplexity # This could become a list or a more complex object if needed
     estimated_duration: int # in seconds
     required_agents: List[str]
     dependencies: List[str]
     risk_level: float # 0.0 to 1.0
     confidence: float # 0.0 to 1.0
     metadata: Dict[str, Any]
+    # Add new fields to flag specific needs
+    requires_advanced_reasoning: bool = False
+    requires_external_knowledge: bool = False
+    requires_planning: bool = False
 
 class TaskAnalyzer:
     """
@@ -43,7 +54,7 @@ class TaskAnalyzer:
         self.complexity_indicators = self._initialize_complexity_indicators()
 
     def _initialize_patterns(self) -> Dict[TaskType, List[str]]:
-        return {
+        patterns = {
             TaskType.CODE_GENERATION: [
                 r'create\s+(?:a\s+)?(?:new\s+)?(?:function|class|module|component)',
                 r'generate\s+(?:code|function|class)',
@@ -82,7 +93,7 @@ class TaskAnalyzer:
             TaskType.ARCHITECTURE: [
                 r'design\s+(?:the\s+)?(?:architecture|system|structure)',
                 r'architect\s+(?:a\s+)?(?:system|solution)',
-                r'plan\s+(?:the\s+)?(?:system|architecture)',
+                # r'plan\s+(?:the\s+)?(?:system|architecture)', # Moved to PLANNING
                 r'structure\s+(?:the\s+)?project',
                 r'design\s+patterns'
             ],
@@ -106,10 +117,24 @@ class TaskAnalyzer:
                 r'use\s+(?:latest\s+)?(?:ai|ml|research)',
                 r'apply\s+(?:new\s+)?(?:methods|techniques)',
                 r'cutting[- ]edge\s+(?:approach|method)'
+            ],
+            TaskType.COMPLEX_REASONING: [
+                r'explain\s+step-by-step', r'deduce', r'what if', r'reason about',
+                r'analyze implications', r'logical conclusion', r'problem solve'
+            ],
+            TaskType.KNOWLEDGE_LOOKUP: [
+                r'find information about', r'research topic', r'get facts on',
+                r'lookup', r'tell me about', r'what is known about'
+            ],
+            TaskType.PLANNING: [
+                r'plan\s+for', r'create a plan', r'outline steps',
+                r'sequence of actions', r'develop a strategy for', r'roadmap for'
             ]
         }
+        return patterns
 
     def _initialize_complexity_indicators(self) -> Dict[str, float]:
+        # Existing indicators are fine, no change needed here for now
         return {
             'simple': 0.1, 'basic': 0.1, 'easy': 0.1, 'quick': 0.2,
             'small': 0.2, 'minor': 0.2, 'trivial': 0.1,
@@ -125,47 +150,82 @@ class TaskAnalyzer:
     async def analyze_task(self, input_text: str, context: Dict[str, Any] = None) -> TaskAnalysis:
         context = context or {}
         task_type = await self._detect_task_type(input_text)
-        complexity = await self._analyze_complexity(input_text, task_type)
-        duration = await self._estimate_duration(input_text, task_type, complexity)
-        required_agents = await self._determine_required_agents(task_type, complexity, input_text)
+
+        # Determine flags for advanced capabilities BEFORE general complexity
+        requires_advanced_reasoning = task_type == TaskType.COMPLEX_REASONING or \
+                                     any(kw in input_text.lower() for kw in ['think step-by-step', 'deliberate thought'])
+        requires_external_knowledge = task_type == TaskType.KNOWLEDGE_LOOKUP or \
+                                      any(kw in input_text.lower() for kw in ['search web for', 'find recent data on'])
+        requires_planning = task_type == TaskType.PLANNING
+
+        complexity_enum, complexity_score = await self._analyze_complexity(input_text, task_type, requires_advanced_reasoning, requires_external_knowledge)
+
+        duration = await self._estimate_duration(input_text, task_type, complexity_enum)
+        required_agents = await self._determine_required_agents(task_type, complexity_enum, input_text, requires_advanced_reasoning, requires_external_knowledge)
         dependencies = await self._identify_dependencies(input_text, context)
-        risk_level = await self._assess_risk_level(input_text, task_type, complexity)
+        risk_level = await self._assess_risk_level(input_text, task_type, complexity_enum)
         confidence = await self._calculate_confidence(input_text, task_type)
         metadata = await self._extract_metadata(input_text, context)
+        metadata['complexity_score_numeric'] = complexity_score # Store numeric score too
 
         return TaskAnalysis(
             task_type=task_type,
-            complexity=complexity,
+            complexity=complexity_enum,
             estimated_duration=duration,
             required_agents=required_agents,
             dependencies=dependencies,
             risk_level=risk_level,
             confidence=confidence,
-            metadata=metadata
+            metadata=metadata,
+            requires_advanced_reasoning=requires_advanced_reasoning,
+            requires_external_knowledge=requires_external_knowledge,
+            requires_planning=requires_planning
         )
 
     async def _detect_task_type(self, input_text: str) -> TaskType:
         text_lower = input_text.lower()
-        type_scores = {}
+        type_scores: Dict[TaskType, int] = {ttype: 0 for ttype in TaskType}
+
+        # Prioritize more specific task types
+        priority_order = [
+            TaskType.COMPLEX_REASONING, TaskType.KNOWLEDGE_LOOKUP, TaskType.PLANNING,
+            TaskType.BUG_FIX, TaskType.RESEARCH_INTEGRATION, TaskType.SECURITY_AUDIT,
+            TaskType.PERFORMANCE_OPTIMIZATION, TaskType.REFACTORING, TaskType.ARCHITECTURE,
+            TaskType.TESTING, TaskType.DOCUMENTATION, TaskType.CODE_GENERATION
+        ]
+
+        for task_type_check in priority_order:
+            patterns = self.task_patterns.get(task_type_check, [])
+            for pattern in patterns:
+                if re.search(pattern, text_lower):
+                    return task_type_check # Return first specific match
+
+        # Fallback to general scoring if no specific priority match
         for task_type, patterns in self.task_patterns.items():
             score = sum(len(re.findall(pattern, text_lower)) for pattern in patterns)
             type_scores[task_type] = score
 
         if type_scores:
-            best_type = max(type_scores, key=type_scores.get)
-            if type_scores[best_type] > 0:
-                return best_type
+            # Filter out types with zero scores before max, or handle if all are zero
+            positive_scores = {k: v for k,v in type_scores.items() if v > 0}
+            if positive_scores:
+                return max(positive_scores, key=positive_scores.get)
         return TaskType.UNKNOWN
 
-    async def _analyze_complexity(self, input_text: str, task_type: TaskType) -> TaskComplexity:
+    async def _analyze_complexity(self, input_text: str, task_type: TaskType,
+                                  adv_reasoning: bool, ext_knowledge: bool) -> tuple[TaskComplexity, float]:
         text_lower = input_text.lower()
         base_complexity_map = {
             TaskType.CODE_GENERATION: 0.4, TaskType.BUG_FIX: 0.5, TaskType.REFACTORING: 0.6,
-            TaskType.TESTING: 0.3, TaskType.DOCUMENTATION: 0.2, TaskType.ARCHITECTURE: 0.8,
-            TaskType.SECURITY_AUDIT: 0.7, TaskType.PERFORMANCE_OPTIMIZATION: 0.7,
-            TaskType.RESEARCH_INTEGRATION: 0.9, TaskType.UNKNOWN: 0.4
+            TaskType.TESTING: 0.3, TaskType.DOCUMENTATION: 0.2, TaskType.ARCHITECTURE: 0.7,
+            TaskType.SECURITY_AUDIT: 0.6, TaskType.PERFORMANCE_OPTIMIZATION: 0.6,
+            TaskType.RESEARCH_INTEGRATION: 0.8, TaskType.COMPLEX_REASONING: 0.75,
+            TaskType.KNOWLEDGE_LOOKUP: 0.3, TaskType.PLANNING: 0.65, TaskType.UNKNOWN: 0.4
         }
         complexity_score = base_complexity_map.get(task_type, 0.5)
+
+        if adv_reasoning: complexity_score = max(complexity_score, 0.7) # Boost complexity if advanced reasoning needed
+        if ext_knowledge: complexity_score = max(complexity_score, 0.5) # Boost for external knowledge
 
         for indicator, weight in self.complexity_indicators.items():
             if indicator in text_lower:
@@ -177,47 +237,67 @@ class TaskAnalyzer:
             ('distributed', 0.5), ('concurrent', 0.4), ('async', 0.3),
             ('real-time', 0.4), ('scalable', 0.3), ('enterprise', 0.4)
         ]
-        for factor, weight in complexity_factors:
+        for factor, weight_factor in complexity_factors:
             if factor in text_lower:
-                complexity_score += weight * 0.1
+                complexity_score += weight_factor * 0.1 # More subtle influence
 
         complexity_score = min(complexity_score, 1.0)
 
-        if complexity_score < 0.3: return TaskComplexity.SIMPLE
-        if complexity_score < 0.6: return TaskComplexity.MODERATE
-        if complexity_score < 0.8: return TaskComplexity.COMPLEX
-        return TaskComplexity.EXPERT
+        # Determine enum based on score, but also consider flags for specific complexity types
+        if adv_reasoning and complexity_score >= 0.65: return TaskComplexity.REQUIRES_DEEP_REASONING, complexity_score
+        if ext_knowledge and complexity_score >= 0.5: return TaskComplexity.REQUIRES_KNOWLEDGE_GRAPH, complexity_score # Example specific complexity
+
+        if complexity_score < 0.3: return TaskComplexity.SIMPLE, complexity_score
+        if complexity_score < 0.6: return TaskComplexity.MODERATE, complexity_score
+        if complexity_score < 0.8: return TaskComplexity.COMPLEX, complexity_score
+        return TaskComplexity.EXPERT, complexity_score
 
     async def _estimate_duration(self, input_text: str, task_type: TaskType, complexity: TaskComplexity) -> int:
+        # Duration estimation can remain similar, but complexity enum might be more specific now
         base_durations = {
             TaskType.CODE_GENERATION: 120, TaskType.BUG_FIX: 180, TaskType.REFACTORING: 240,
             TaskType.TESTING: 90, TaskType.DOCUMENTATION: 60, TaskType.ARCHITECTURE: 300,
             TaskType.SECURITY_AUDIT: 240, TaskType.PERFORMANCE_OPTIMIZATION: 300,
-            TaskType.RESEARCH_INTEGRATION: 360, TaskType.UNKNOWN: 120
+            TaskType.RESEARCH_INTEGRATION: 360, TaskType.COMPLEX_REASONING: 280,
+            TaskType.KNOWLEDGE_LOOKUP: 100, TaskType.PLANNING: 200, TaskType.UNKNOWN: 120
         }
+        # Map new specific complexities to multipliers or handle them
         complexity_multipliers = {
             TaskComplexity.SIMPLE: 0.5, TaskComplexity.MODERATE: 1.0,
-            TaskComplexity.COMPLEX: 2.0, TaskComplexity.EXPERT: 3.0
+            TaskComplexity.COMPLEX: 2.0, TaskComplexity.EXPERT: 3.0,
+            TaskComplexity.REQUIRES_DEEP_REASONING: 2.5, # Example
+            TaskComplexity.REQUIRES_KNOWLEDGE_GRAPH: 1.5  # Example
         }
         base_duration = base_durations.get(task_type, 120)
-        multiplier = complexity_multipliers.get(complexity, 1.0)
-        length_factor = min(len(input_text) / 1000.0, 2.0) # ensure float division
+        multiplier = complexity_multipliers.get(complexity, 1.0) # Fallback for unmapped specific complexities
+        length_factor = min(len(input_text) / 1000.0, 2.0)
         estimated_duration = int(base_duration * multiplier * (1 + length_factor * 0.5))
         return min(max(estimated_duration, 30), 1800)
 
-    async def _determine_required_agents(self, task_type: TaskType, complexity: TaskComplexity, input_text: str) -> List[str]:
+    async def _determine_required_agents(self, task_type: TaskType, complexity: TaskComplexity,
+                                         input_text: str, adv_reasoning: bool, ext_knowledge: bool) -> List[str]:
         agent_requirements_map = {
             TaskType.CODE_GENERATION: ['codemaster'], TaskType.BUG_FIX: ['codemaster', 'test'],
             TaskType.REFACTORING: ['codemaster', 'refactor'], TaskType.TESTING: ['test'],
             TaskType.DOCUMENTATION: ['document'], TaskType.ARCHITECTURE: ['architect'],
             TaskType.SECURITY_AUDIT: ['security'], TaskType.PERFORMANCE_OPTIMIZATION: ['refactor', 'test'],
-            TaskType.RESEARCH_INTEGRATION: ['research', 'codemaster'], TaskType.UNKNOWN: ['codemaster']
+            TaskType.RESEARCH_INTEGRATION: ['research', 'codemaster'],
+            TaskType.COMPLEX_REASONING: ['codemaster', 'architect'], # Example, could be a 'ReasoningAgent'
+            TaskType.KNOWLEDGE_LOOKUP: ['research'], # Example, could be 'KnowledgeAgent'
+            TaskType.PLANNING: ['architect', 'codemaster'],
+            TaskType.UNKNOWN: ['codemaster']
         }
         required_agents = agent_requirements_map.get(task_type, ['codemaster']).copy()
 
-        if complexity in [TaskComplexity.COMPLEX, TaskComplexity.EXPERT]:
+        if complexity in [TaskComplexity.COMPLEX, TaskComplexity.EXPERT, TaskComplexity.REQUIRES_DEEP_REASONING]:
             if 'architect' not in required_agents: required_agents.append('architect')
             if 'test' not in required_agents: required_agents.append('test')
+
+        if adv_reasoning and 'ReasoningAgent' not in required_agents: # Assuming a future ReasoningAgent
+            # required_agents.append('ReasoningAgent')
+            pass # For now, existing agents handle it
+        if ext_knowledge and 'research' not in required_agents:
+            required_agents.append('research') # ResearchAgent can handle knowledge lookup
 
         text_lower = input_text.lower()
         keyword_agents_map = {
@@ -242,16 +322,20 @@ class TaskAnalyzer:
         return list(set(dependencies))
 
     async def _assess_risk_level(self, input_text: str, task_type: TaskType, complexity: TaskComplexity) -> float:
+        # Risk assessment can remain similar, but new task types might have different base risks
         base_risks_map = {
             TaskType.CODE_GENERATION: 0.3, TaskType.BUG_FIX: 0.4, TaskType.REFACTORING: 0.5,
             TaskType.TESTING: 0.2, TaskType.DOCUMENTATION: 0.1, TaskType.ARCHITECTURE: 0.6,
             TaskType.SECURITY_AUDIT: 0.3, TaskType.PERFORMANCE_OPTIMIZATION: 0.5,
-            TaskType.RESEARCH_INTEGRATION: 0.7, TaskType.UNKNOWN: 0.3
+            TaskType.RESEARCH_INTEGRATION: 0.7, TaskType.COMPLEX_REASONING: 0.4,
+            TaskType.KNOWLEDGE_LOOKUP: 0.2, TaskType.PLANNING: 0.5, TaskType.UNKNOWN: 0.3
         }
         risk_score = base_risks_map.get(task_type, 0.3)
         complexity_risk_map = {
             TaskComplexity.SIMPLE: 0.0, TaskComplexity.MODERATE: 0.1,
-            TaskComplexity.COMPLEX: 0.2, TaskComplexity.EXPERT: 0.3
+            TaskComplexity.COMPLEX: 0.2, TaskComplexity.EXPERT: 0.3,
+            TaskComplexity.REQUIRES_DEEP_REASONING: 0.25,
+            TaskComplexity.REQUIRES_KNOWLEDGE_GRAPH: 0.15
         }
         risk_score += complexity_risk_map.get(complexity, 0.1)
         high_risk_keywords = ['production', 'live', 'critical', 'important', 'urgent', 'database', 'security', 'authentication', 'payment', 'user data', 'sensitive', 'confidential']
@@ -261,6 +345,7 @@ class TaskAnalyzer:
         return min(risk_score, 1.0)
 
     async def _calculate_confidence(self, input_text: str, task_type: TaskType) -> float:
+        # Confidence calculation can remain similar
         confidence = 0.7
         if len(input_text) > 50: confidence += 0.1
         if len(input_text) > 200: confidence += 0.1
@@ -268,18 +353,19 @@ class TaskAnalyzer:
         text_lower = input_text.lower()
         term_count = sum(1 for term in technical_terms if term in text_lower)
         confidence += min(term_count * 0.05, 0.2)
-        action_words = ['create', 'build', 'implement', 'fix', 'optimize', 'refactor', 'test', 'document', 'design', 'analyze']
+        action_words = ['create', 'build', 'implement', 'fix', 'optimize', 'refactor', 'test', 'document', 'design', 'analyze', 'plan', 'reason', 'lookup']
         action_count = sum(1 for word in action_words if word in text_lower)
         if action_count > 0: confidence += 0.1
         return min(confidence, 1.0)
 
     async def _extract_metadata(self, input_text: str, context: Dict[str, Any]) -> Dict[str, Any]:
+        # Metadata extraction can remain similar
         metadata = {
             'input_length': len(input_text),
             'word_count': len(input_text.split()),
             'has_code_snippets': bool(re.search(r'```|`[^`]+`', input_text)),
             'has_urls': bool(re.search(r'https?://', input_text)),
-            'has_file_references': bool(re.search(r'\.\w{2,4}(?:\s|$)', input_text)), # Corrected regex escape
+            'has_file_references': bool(re.search(r'\.\w{2,4}(?:\s|$)', input_text)),
             'urgency_indicators': self._detect_urgency(input_text),
             'programming_languages': self._detect_languages(input_text),
             'frameworks_mentioned': self._detect_frameworks(input_text)
