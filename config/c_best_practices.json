@@ -1,0 +1,48 @@
+{
+    "general_style": [
+        "Use consistent indentation (e.g., 4 spaces or tabs, but not mixed).",
+        "Keep lines to a reasonable length (e.g., 80-100 characters).",
+        "Write clear and concise comments for complex sections of code, or to explain non-obvious logic.",
+        "Use meaningful names for variables, functions, and types.",
+        "Define constants using `#define` or `const` for magic numbers or strings."
+    ],
+    "headers": [
+        "Always include guards (`#ifndef HEADER_H_ ... #define HEADER_H_ ... #endif`) in header files to prevent multiple inclusions.",
+        "Include only necessary headers in each source file.",
+        "Header files should generally only contain declarations, not definitions (except for inline functions or static consts)."
+    ],
+    "functions": [
+        "Functions should ideally be short and perform a single, well-defined task.",
+        "Provide clear function prototypes (declarations) before use, typically in header files.",
+        "Use `static` for functions that are local to a single `.c` file (internal linkage).",
+        "Clearly document function parameters, return values, and any side effects."
+    ],
+    "memory_management": [
+        "Always check the return value of memory allocation functions (`malloc`, `calloc`, `realloc`) for `NULL` to handle allocation failures.",
+        "For every `malloc`/`calloc`/`realloc`, ensure there is a corresponding `free` call to prevent memory leaks.",
+        "Be cautious of buffer overflows; use bounded string/memory functions (e.g., `strncpy`, `snprintf`, `memcpy_s` if available) instead of unbounded ones like `strcpy`, `sprintf`, `gets`.",
+        "Initialize allocated memory if its contents are indeterminate (e.g., using `calloc` or `memset` after `malloc`).",
+        "Avoid double-freeing memory. Set pointers to `NULL` after freeing them if they might be used again."
+    ],
+    "pointers": [
+        "Initialize pointers to `NULL` or a valid address before first use.",
+        "Always check pointers for `NULL` before dereferencing them, if there's a chance they could be `NULL`.",
+        "Be careful with pointer arithmetic to stay within allocated memory bounds.",
+        "Understand the difference between `const char *p`, `char * const p`, and `const char * const p`."
+    ],
+    "error_handling": [
+        "Check return values of functions that can fail and handle errors appropriately.",
+        "Use `errno` and `perror()` or `strerror()` for reporting standard library errors when indicated by function documentation.",
+        "Define clear error codes or return values for your own functions to indicate success or failure.",
+        "Avoid exiting the program abruptly (e.g., with `exit()`) in library code; return error codes instead."
+    ],
+    "types_and_structs": [
+        "Use `typedef` to create meaningful aliases for complex types or to improve portability.",
+        "When defining structs, consider memory alignment and padding if it's critical for performance or interfacing with hardware/network protocols.",
+        "Prefer `enum` for groups of related integer constants over multiple `#define` directives."
+    ],
+    "preprocessor": [
+        "Use macros (`#define`) sparingly and prefer inline functions or `const` variables where possible for better type safety and debuggability.",
+        "Wrap multi-line macro definitions with `do { ... } while(0)` to ensure correct behavior in all contexts."
+    ]
+}
