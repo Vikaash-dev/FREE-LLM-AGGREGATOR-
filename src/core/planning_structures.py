@@ -24,7 +24,11 @@ class ProjectContext:
 
 @dataclass
 class Task:
-    '''Represents a single task or sub-task within an execution plan.'''
+    '''
+    Represents a single task or sub-task within an execution plan.
+    The `required_role` field is used by the CrewManager to dispatch this task
+    to an agent possessing that role.
+    '''
     task_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     description: str
     status: TaskStatus = TaskStatus.PENDING
@@ -34,6 +38,7 @@ class Task:
     output: Optional[Any] = None # Result or output of the task
     reasoning_log: List[str] = field(default_factory=list) # Log of reasoning steps or decisions for this task
     raw_instruction: Optional[str] = None # The original instruction that led to this task, if applicable
+    required_role: Optional[str] = None # Specifies the role required to execute this task.
 
     # To allow Task to have sub_tasks of type Task, we need to handle potential forward references
     # This is generally handled by Python 3.7+ with `from __future__ import annotations`
