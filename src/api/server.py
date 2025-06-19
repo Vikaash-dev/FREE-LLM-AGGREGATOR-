@@ -32,6 +32,23 @@ from ..providers.openrouter import create_openrouter_provider
 from ..providers.groq import create_groq_provider
 from ..providers.cerebras import create_cerebras_provider
 
+# Imports for CodeMasterAgent and its models
+import uuid # For generating request_id
+from pathlib import Path
+import sys
+# Adjust sys.path to allow importing from project root for new_code_models
+# and openhands_2_0 sibling directory.
+# This assumes server.py is in src/api/server.py
+project_root = Path(__file__).resolve().parent.parent.parent
+sys.path.insert(0, str(project_root))
+
+from openhands_2_0.core.agent_swarm.agents.codemaster_agent import CodeMasterAgent
+from new_code_models import CodeExecutionRequest, CodeExecutionResponse, CodeTaskType
+
+
+logger = logging.getLogger(__name__)
+security = HTTPBearer(auto_error=False)
+
 
 logger = logging.getLogger(__name__)
 security = HTTPBearer(auto_error=False)
@@ -44,37 +61,27 @@ if not settings.ADMIN_TOKEN:
 
 # Global aggregator instance
 aggregator: Optional[LLMAggregator] = None
+code_master_agent: Optional[CodeMasterAgent] = None # Added for CodeMasterAgent
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan manager."""
-    global aggregator
+    global aggregator, code_master_agent # Added code_master_agent
     
     # Startup
-    logger.info("Starting LLM API Aggregator...")
+    logger.info("Starting LLM API Aggregator and OpenHands Agents...")
     
-    # Initialize components
+    # Initialize components for LLM Aggregator
     account_manager = AccountManager()
     rate_limiter = RateLimiter()
-    
-    # Create providers
     providers = []
-    
-    # Initialize providers with empty credentials (will be added via API)
     openrouter = create_openrouter_provider([])
     groq = create_groq_provider([])
     cerebras = create_cerebras_provider([])
-    
     providers.extend([openrouter, groq, cerebras])
-    
-    # Create provider configs dict
     provider_configs = {provider.name: provider.config for provider in providers}
-    
-    # Initialize router
     router = ProviderRouter(provider_configs)
-    
-    # Initialize aggregator
     aggregator = LLMAggregator(
         providers=providers,
         account_manager=account_manager,
@@ -82,15 +89,30 @@ async def lifespan(app: FastAPI):
         rate_limiter=rate_limiter
     )
     
-    logger.info("LLM API Aggregator started successfully")
+    # Initialize CodeMasterAgent
+    code_master_agent = CodeMasterAgent()
+
+    # Gather async initializations
+    # Note: LLMAggregator itself doesn't have an async init in this snippet
+    # If it did, it would be: await aggregator.initialize() or similar
+    init_tasks = [code_master_agent.initialize()]
+    # Add other agent initializations here if needed:
+    # tasks_to_gather.append(other_agent.initialize())
+
+    await asyncio.gather(*init_tasks)
+
+    logger.info("LLM API Aggregator and OpenHands Agents started successfully")
     
     yield
     
     # Shutdown
-    logger.info("Shutting down LLM API Aggregator...")
+    logger.info("Shutting down LLM API Aggregator and OpenHands Agents...")
     if aggregator:
         await aggregator.close()
-    logger.info("LLM API Aggregator shut down")
+    # Add shutdown for code_master_agent if it has one:
+    # if code_master_agent and hasattr(code_master_agent, 'shutdown'):
+    #     await code_master_agent.shutdown()
+    logger.info("LLM API Aggregator and OpenHands Agents shut down")
 
 
 # Create FastAPI app
@@ -393,3 +415,69 @@ if __name__ == "__main__":
     # Basic logging configuration for startup messages
     logging.basicConfig(level=settings.LOG_LEVEL.upper())
     run_server()
+
+# New endpoint for CodeMasterAgent
+@app.post("/v1/code/execute", response_model=CodeExecutionResponse, tags=["Code Execution"])
+async def execute_code_task(
+    request: CodeExecutionRequest,
+    # user_id: Optional[str] = Depends(get_user_id) # User context can be added if needed
+):
+    """
+    Executes a code-related task (generate, analyze, refactor, etc.) using the CodeMasterAgent.
+    """
+    global code_master_agent
+    if not code_master_agent:
+        logger.error("CodeMasterAgent not initialized during server startup.")
+        raise HTTPException(status_code=503, detail="CodeMasterAgent not available. Service not ready.")
+
+    # Prepare input for the CodeMasterAgent
+    # CodeMasterAgent's execute expects 'input_data' (a dict) and 'context'.
+    # The 'text' field within input_data is often the primary prompt.
+    input_data_for_agent = {
+        "text": request.user_prompt, # Main instruction
+        "code": request.code_snippet,
+        "language": request.language,
+        "task_type_hint": request.task_type.value, # Pass the enum value to help agent determine task
+        "dependencies": request.dependencies # For generation tasks primarily
+    }
+
+    request_context = request.context or {}
+
+    try:
+        agent_response = await code_master_agent.execute(
+            input_data=input_data_for_agent,
+            context=request_context
+        )
+    except Exception as e:
+        logger.exception(f"CodeMasterAgent execution error: {e}")
+        raise HTTPException(status_code=500, detail=f"Error during code task execution: {str(e)}")
+
+    req_id = uuid.uuid4().hex
+
+    if agent_response.get("success"):
+        agent_output = agent_response.get("output", {})
+        # Map agent_output fields to CodeExecutionResponse fields
+        # Handle cases where some fields might be None or under different keys in agent_output
+        return CodeExecutionResponse(
+            request_id=req_id,
+            task_type=request.task_type,
+            status="completed",
+            output_code=agent_output.get("code"),
+            explanation=agent_output.get("explanation") or agent_output.get("summary") or agent_output.get("analysis_summary"),
+            # Consolidate various possible analysis keys from CodeMasterAgent general tasks
+            analysis=agent_output.get("analysis") or agent_output.get("structure_analysis") or agent_output.get("review_summary") or agent_output.get("details"),
+            self_reflection=agent_output.get("self_reflection"),
+            reasoning_log=agent_output.get("reasoning_log"),
+            error_message=None
+        )
+    else:
+        # Attempt to get reflection and reasoning even from failed agent responses if available
+        agent_output_on_failure = agent_response.get("output", {})
+        return CodeExecutionResponse(
+            request_id=req_id,
+            task_type=request.task_type,
+            status="failed",
+            error_message=agent_response.get("error", "Unknown error from CodeMasterAgent"),
+            self_reflection=agent_output_on_failure.get("self_reflection"),
+            reasoning_log=agent_output_on_failure.get("reasoning_log")
+        )
