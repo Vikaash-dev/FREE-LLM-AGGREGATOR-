@@ -1,28 +1,62 @@
 {
     "general": [
-        "Use clear and descriptive variable and function names.",
-        "Write comments for complex logic or non-obvious code sections.",
-        "Keep code DRY (Don't Repeat Yourself).",
-        "Follow PEP 8 style guidelines for code formatting."
+        "Use clear and descriptive variable and function names (snake_case for functions/variables, PascalCase for classes).",
+        "Write comments for complex logic or non-obvious code sections. Explain 'why', not just 'what'.",
+        "Keep code DRY (Don't Repeat Yourself). Refactor repeated code into functions or classes.",
+        "Follow PEP 8 style guidelines for code formatting (e.g., line length, indentation, whitespace).",
+        "Code should be readable and maintainable by others (and your future self).",
+        "Avoid magic numbers; use named constants instead.",
+        "Explicit is better than implicit.",
+        "Simple is better than complex."
     ],
     "functions": [
-        "Functions should ideally be short and focus on a single responsibility.",
-        "Include docstrings for all public functions, explaining purpose, arguments, and return values.",
-        "Use type hints for function arguments and return types.",
-        "Avoid using mutable default arguments."
+        "Functions should ideally be short (e.g., < 30-50 lines) and focus on a single responsibility (Single Responsibility Principle).",
+        "Include comprehensive docstrings for all public functions, explaining purpose, arguments (types and meaning), return values (type and meaning), and any exceptions raised (PEP 257).",
+        "Use type hints for function arguments and return types (PEP 484).",
+        "Avoid using mutable default arguments (e.g., `def foo(a, b=[])`). Use `None` and initialize inside if needed.",
+        "Limit the number of function arguments (e.g., to 3-4 if possible). Consider using keyword arguments or dataclasses for many parameters.",
+        "Return values consistently; avoid returning different types for different conditions if possible, or document clearly.",
+        "Prefer pure functions (no side effects) when feasible, as they are easier to test and reason about."
     ],
     "classes": [
-        "Class names should use PascalCase.",
-        "Include docstrings for all public classes and methods.",
-        "Initialize instance variables in the __init__ method."
+        "Class names should use PascalCase (CapWords).",
+        "Include comprehensive docstrings for all public classes and methods (PEP 257).",
+        "Initialize instance variables in the `__init__` method.",
+        "Use properties (`@property`) for managed attributes instead of direct public variable access if logic is needed on get/set.",
+        "Follow principles like SOLID where applicable, especially Single Responsibility Principle for classes.",
+        "Use `super()` for calling parent class methods in inheritance."
     ],
     "error_handling": [
-        "Handle exceptions gracefully using try-except blocks.",
-        "Use specific exception types rather than a bare 'except:'.",
-        "Clean up resources using 'finally' or context managers ('with' statement)."
+        "Handle exceptions gracefully using try-except blocks where errors are anticipated.",
+        "Use specific exception types in `except` clauses (e.g., `except ValueError:`) rather than a bare `except:` or `except Exception: diligence`.",
+        "Clean up resources reliably using `finally` blocks or context managers (`with` statement).",
+        "Log errors effectively with sufficient context for debugging.",
+        "Avoid catching exceptions you cannot handle meaningfully; let them propagate if necessary.",
+        "Define custom exceptions for application-specific error conditions when appropriate."
     ],
     "imports": [
-        "Import modules at the top of the file.",
-        "Avoid wildcard imports (from module import *)."
+        "Import modules at the top of the file, after any module comments and docstrings, and before module globals and constants.",
+        "Imports should usually be on separate lines.",
+        "Order imports: standard library, then related third-party, then local application/library specific.",
+        "Use absolute imports by default. Explicit relative imports (e.g., `from . import sibling`) are acceptable within packages.",
+        "Avoid wildcard imports (`from module import *`) as they make namespaces unclear."
+    ],
+    "performance": [
+        "Be mindful of algorithmic complexity (Big O notation).",
+        "Profile code before optimizing (e.g., using `cProfile`). Don't guess performance bottlenecks.",
+        "Use built-in functions and libraries where possible as they are often implemented in C and highly optimized.",
+        "For string concatenation in loops, prefer `\"\".join(list_of_strings)` over repeated `+=`."
+    ],
+    "security": [
+        "Validate and sanitize all external inputs (e.g., user input, API responses, file contents).",
+        "Avoid using `eval()` and `exec()` with untrusted strings.",
+        "Be cautious with deserialization of data from untrusted sources (e.g., `pickle`).",
+        "Store sensitive information like API keys and passwords securely, not hardcoded in source files. Use environment variables or secret management tools.",
+        "Use parameterized queries or ORMs to prevent SQL injection vulnerabilities."
+    ],
+    "idiomatic_python": [
+        "Leverage Python's idioms: list comprehensions, generator expressions, context managers (`with`), `enumerate`, `zip`.",
+        "Check for `None` using `is None` or `is not None`, not `== None`.",
+        "Use truthiness of collections/sequences (e.g., `if my_list:` instead of `if len(my_list) > 0:`)."
     ]
 }

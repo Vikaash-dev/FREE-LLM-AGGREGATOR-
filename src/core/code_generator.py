@@ -4,12 +4,120 @@ import json # For potential parsing if LLM wraps output unexpectedly, though dir
 import ast # Import the ast module
 import os # For path joining
 import re # For regex-based naming convention checks
+import subprocess # For running flake8
+import tempfile # For temporary file
+import sys # For sys.executable
 
 from .aggregator import LLMAggregator
 from .generation_structures import CodeSpecification, CodeGenerationResult
 from ..models import ChatCompletionRequest, Message as OpenHandsMessage # Ensure OpenHandsMessage alias
 
 logger = structlog.get_logger(__name__) # Ensure logger is available if not already defined at module level
+
+# --- Helper function for Flake8 ---
+def run_flake8_on_code(code_string: str) -> List[Dict[str, Any]]:
+    '''
+    Runs flake8 on a given Python code string and parses its output.
+
+    Args:
+        code_string: The Python code to check.
+
+    Returns:
+        A list of dictionaries, where each dictionary represents a flake8 issue.
+        Example: [{'line': 1, 'col': 1, 'code': 'F401', 'message': "'module' imported but unused"}]
+        Returns an empty list if no issues are found or if flake8 fails to run.
+    '''
+    issues_found: List[Dict[str, Any]] = []
+    if not code_string.strip():
+        logger.debug("Skipping flake8 on empty code string.")
+        return issues_found
+
+    # Flake8 needs a file to operate on.
+    # We use a temporary file with a .py extension.
+    # tempfile.NamedTemporaryFile can be tricky with subprocesses on Windows (file locking).
+    # A more robust approach is to create a temp dir and a file within it.
+
+    tmp_dir = None
+    try:
+        tmp_dir = tempfile.mkdtemp()
+        tmp_file_path = os.path.join(tmp_dir, "temp_code_to_lint.py")
+
+        with open(tmp_file_path, "w", encoding="utf-8") as f:
+            f.write(code_string)
+
+        logger.debug(f"Running flake8 on temporary file: {tmp_file_path}")
+
+        # Common flake8 invocation. Adjust options as needed.
+        # --select=E,W,F to get errors, warnings, and fatal errors.
+        # --format='%(row)d,%(col)d,%(code)s,%(text)s' for easy parsing.
+        # Add --isolated to ignore project/user flake8 config for consistent behavior.
+        flake8_cmd = [
+            sys.executable, # Use the current Python interpreter to run flake8 module
+            "-m", "flake8",
+            tmp_file_path,
+            "--format=%(row)d,%(col)d,%(code)s,%(text)s",
+            "--isolated"
+        ]
+
+        # Set a timeout for flake8 process, e.g., 10 seconds
+        process_timeout = 10
+
+        completed_process = subprocess.run(
+            flake8_cmd,
+            capture_output=True,
+            text=True,
+            timeout=process_timeout,
+            check=False # Don't raise exception for non-zero exit code (flake8 exits non-zero if issues found)
+        )
+
+        if completed_process.stderr:
+            logger.warn("Flake8 produced stderr output", stderr=completed_process.stderr.strip())
+
+        if completed_process.stdout:
+            output_lines = completed_process.stdout.strip().splitlines()
+            for line in output_lines:
+                parts = line.split(',', 3) # Split into 4 parts: row, col, code, text
+                if len(parts) == 4:
+                    try:
+                        issues_found.append({
+                            "line": int(parts[0]),
+                            "col": int(parts[1]),
+                            "code": parts[2].strip(),
+                            "message": parts[3].strip()
+                        })
+                    except ValueError:
+                        logger.warn("Failed to parse flake8 output line", line=line, reason="ValueError converting line/col to int")
+                elif line.strip(): # Non-empty line that doesn't match format
+                    logger.warn("Unparseable flake8 output line", line=line)
+            logger.debug(f"Flake8 found {len(issues_found)} issues.")
+        else:
+            logger.debug("Flake8 found no issues (stdout was empty).")
+            if completed_process.returncode != 0 and not completed_process.stderr: # No stdout, but error code
+                 logger.warn("Flake8 exited with non-zero code but no stdout/stderr.", return_code=completed_process.returncode)
+
+
+    except subprocess.TimeoutExpired:
+        logger.error(f"Flake8 execution timed out after {process_timeout} seconds.", file_path=tmp_file_path if 'tmp_file_path' in locals() else "N/A")
+        issues_found.append({"line": 0, "col": 0, "code": "LNT001", "message": "Linter execution timed out."}) # Custom code for timeout
+    except FileNotFoundError: # If flake8 or python executable is not found
+        logger.error("Flake8 command not found. Ensure flake8 is installed and accessible.", exc_info=True)
+        issues_found.append({"line": 0, "col": 0, "code": "LNT002", "message": "Linter (flake8) not found or not executable."})
+    except Exception as e:
+        logger.error("An unexpected error occurred while running flake8", error=str(e), exc_info=True)
+        issues_found.append({"line": 0, "col": 0, "code": "LNT003", "message": f"Unexpected error during linting: {str(e)}"})
+    finally:
+        if tmp_dir and os.path.exists(tmp_dir):
+            try:
+                # Clean up: Remove temporary file and directory
+                if 'tmp_file_path' in locals() and os.path.exists(tmp_file_path):
+                    os.remove(tmp_file_path)
+                os.rmdir(tmp_dir)
+                logger.debug(f"Successfully cleaned up temporary directory: {tmp_dir}")
+            except Exception as e_cleanup:
+                logger.error(f"Error cleaning up temporary directory {tmp_dir}", error=str(e_cleanup), exc_info=True)
+
+    return issues_found
+
 
 # --- Placeholder Components for Code Generation ---
 # These are part of the conceptual design from DEVIKA_AI_INTEGRATION.md
@@ -261,15 +369,169 @@ class BestPracticesDatabase:
 
 class CodeQualityChecker:
     '''
-    Performs basic custom quality checks on Python code.
+    Performs quality checks on Python code, integrating flake8 and custom AST-based checks.
     '''
-    def __init__(self, max_line_length: int = 100):
-        self.max_line_length = max_line_length
-        logger.info(f"CodeQualityChecker initialized (max_line_length={max_line_length}).")
+    def __init__(self,
+                 max_line_length: int = 100, # Custom check, though flake8 also has one (E501)
+                 max_function_lines: int = 50
+                ):
+        self.max_line_length = max_line_length # Kept for custom check, can be compared with flake8
+        self.max_function_lines = max_function_lines
+        logger.info(f"CodeQualityChecker initialized (integrating Flake8; custom max_line_length={max_line_length}, max_function_lines={self.max_function_lines}).")
+
+    # ... (_is_snake_case, _is_pascal_case helper methods as before) ...
+    def _is_snake_case(self, name: str) -> bool:
+        return re.fullmatch(r'_?[a-z0-9_]+', name) is not None
+
+    def _is_pascal_case(self, name: str) -> bool:
+        return re.fullmatch(r'[A-Z][a-zA-Z0-9]*', name) is not None
 
     def check_python_code(self, code: str, ast_analysis_results: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        '''
-        Performs basic custom quality checks on the provided Python code string.
+        logger.info("Checking Python code quality (with Flake8 and custom checks)", code_length=len(code))
+        all_issues_found: List[Dict[str, Any]] = [] # Store structured issues
+
+        lines = code.splitlines()
+        num_lines = len(lines)
+
+        if num_lines == 0:
+            # ... (existing empty code handling) ...
+            logger.warn("Attempted to check quality of empty Python code string.")
+            # Flake8 won't run on empty string either via our helper.
+            return {"issues_found": [{"type": "custom", "message": "Code is empty."}], "quality_score": 0.0, "flake8_issues": 0, "custom_issues": 1}
+
+        # --- Run Flake8 ---
+        flake8_issues_raw = run_flake8_on_code(code)
+        num_flake8_issues = len(flake8_issues_raw)
+        logger.debug("Flake8 analysis complete", num_flake8_issues_found=num_flake8_issues)
+        for issue in flake8_issues_raw:
+            # Add a type to distinguish from custom issues if needed, and ensure consistent keys
+            all_issues_found.append({
+                "type": "flake8",
+                "line": issue.get("line"),
+                "column": issue.get("col"), # Keep original key for now
+                "code": issue.get("code"),
+                "message": issue.get("message")
+            })
+        # --- End Flake8 Run ---
+
+        # --- Custom Checks (Augmenting Flake8) ---
+        custom_issues_found_messages: List[str] = []
+
+        # Check 1: "TODO" or "FIXME" comments (existing)
+        for i, line_content in enumerate(lines):
+            line_num = i + 1
+            if "TODO" in line_content.upper() or "FIXME" in line_content.upper(): # Case insensitive check
+                custom_issues_found_messages.append(f"Line {line_num}: Contains 'TODO' or 'FIXME'.")
+
+        # Check 2: Overly long lines (Custom check - Flake8's E501 might also catch this)
+        # We can keep it if we want a different threshold or just for demonstration.
+        # If Flake8's E501 is preferred, this custom check could be removed or conditional.
+        # For now, let's keep it as an example of augmenting.
+        has_e501 = any(issue.get("code") == "E501" for issue in flake8_issues_raw)
+        if not has_e501: # Only run custom line length if Flake8 didn't already flag it.
+            for i, line_content in enumerate(lines):
+                line_num = i + 1
+                if len(line_content) > self.max_line_length:
+                    custom_issues_found_messages.append(f"Line {line_num}: Exceeds custom max line length of {self.max_line_length} (length: {len(line_content)}).")
+
+        if ast_analysis_results:
+            # Docstring checks (Flake8 has D-series for this with plugins, but basic check is fine here)
+            if "functions" in ast_analysis_results:
+                for func_info in ast_analysis_results["functions"]:
+                    if not func_info.get("docstring_exists"):
+                        custom_issues_found_messages.append(f"Function '{func_info.get('name', 'N/A')}': Missing docstring.")
+            if "classes" in ast_analysis_results:
+                for class_info in ast_analysis_results["classes"]:
+                    if not class_info.get("docstring_exists"):
+                        custom_issues_found_messages.append(f"Class '{class_info.get('name', 'N/A')}': Missing docstring.")
+                    for method_info in class_info.get("methods", []):
+                        if method_info.get("name") != "__init__" and not method_info.get("docstring_exists"):
+                             custom_issues_found_messages.append(f"Method '{class_info.get('name', 'N/A')}.{method_info.get('name', 'N/A')}': Missing docstring.")
+
+            # --- New Checks using AST results ---
+            # Check 4: Variable Naming Conventions (Basic)
+            if "functions" in ast_analysis_results: # Assuming these are top-level for simplicity of example
+                for func_info in ast_analysis_results["functions"]:
+                    func_name = func_info.get("name")
+                    if func_name and not self._is_snake_case(func_name) and not (func_name.startswith("__") and func_name.endswith("__")):
+                        custom_issues_found_messages.append(f"Naming: Function '{func_name}' may not follow snake_case.")
+                    for arg_name in func_info.get("args", []):
+                        arg_base_name = arg_name.split('=')[0].strip()
+                        if not self._is_snake_case(arg_base_name) and arg_base_name not in ["self", "cls"]:
+                             custom_issues_found_messages.append(f"Naming: Function '{func_name}' arg '{arg_base_name}' may not follow snake_case.")
+            if "classes" in ast_analysis_results:
+                for class_info in ast_analysis_results["classes"]:
+                    class_name = class_info.get("name")
+                    if class_name and not self._is_pascal_case(class_name):
+                        custom_issues_found_messages.append(f"Naming: Class '{class_name}' may not follow PascalCase.")
+
+            # Function/Method Max Length
+            if "functions" in ast_analysis_results:
+                for func_info in ast_analysis_results["functions"]:
+                    if func_info.get("body_line_count", 0) > self.max_function_lines:
+                        custom_issues_found_messages.append(f"Length: Function '{func_info.get('name')}' ({func_info.get('body_line_count')} lines) exceeds max {self.max_function_lines} lines.")
+            if "classes" in ast_analysis_results:
+                for class_info in ast_analysis_results["classes"]:
+                    for method_info in class_info.get("methods", []):
+                        if method_info.get("body_line_count", 0) > self.max_function_lines:
+                            custom_issues_found_messages.append(f"Length: Method '{class_info.get('name')}.{method_info.get('name')}' ({method_info.get('body_line_count')} lines) exceeds max {self.max_function_lines} lines.")
+
+            # Wildcard Imports
+            if "imports" in ast_analysis_results:
+                for imp_statement in ast_analysis_results["imports"]:
+                    if "*" in imp_statement and "from" in imp_statement:
+                        custom_issues_found_messages.append(f"Import: Wildcard import found: '{imp_statement}'.")
+
+            # Generic Exceptions
+            if "functions" in ast_analysis_results:
+                for func_info in ast_analysis_results["functions"]:
+                    for line_num in func_info.get("generic_except_clauses", []):
+                        custom_issues_found_messages.append(f"Exception: Function '{func_info.get('name')}' uses generic 'except:' or 'except Exception:' on line {line_num}.")
+            if "classes" in ast_analysis_results:
+                 for class_info in ast_analysis_results["classes"]:
+                    for method_info in class_info.get("methods", []):
+                        for line_num in method_info.get("generic_except_clauses", []):
+                            custom_issues_found_messages.append(f"Exception: Method '{class_info.get('name')}.{method_info.get('name')}' uses generic 'except:' or 'except Exception:' on line {line_num}.")
+        else:
+            logger.debug("AST analysis results not provided, skipping some custom quality checks.")
+
+        for cust_msg in custom_issues_found_messages:
+            all_issues_found.append({
+                "type": "custom",
+                "line": None, # Custom checks might not always have a precise line number from this high level
+                "column": None,
+                "code": "CUST00X", # Example custom code prefix
+                "message": cust_msg
+            })
+        num_custom_issues = len(custom_issues_found_messages)
+        # --- End Custom Checks ---
+
+        # Refined Quality Score
+        # Give more weight to flake8 issues. Max penalty if many issues.
+        # This is still naive. A better system might use flake8 error codes for severity.
+        total_issues = num_flake8_issues + num_custom_issues
+
+        # Example scoring: Each flake8 issue -0.1, each custom issue -0.05
+        # Cap score at 0.0.
+        quality_score = 1.0
+        quality_score -= num_flake8_issues * 0.1
+        quality_score -= num_custom_issues * 0.05
+        quality_score = max(0.0, quality_score)
+
+        logger.info("Python code quality check complete (Flake8 + custom).",
+                    num_flake8_issues=num_flake8_issues,
+                    num_custom_issues=num_custom_issues,
+                    total_issues=total_issues,
+                    quality_score=round(quality_score,2))
+
+        return {
+            "issues_found": all_issues_found, # This now contains dicts, not just strings
+            "quality_score": round(quality_score, 2),
+            "flake8_issue_count": num_flake8_issues,
+            "custom_issue_count": num_custom_issues
+        }
+
+# --- Main Code Generator Class ---
 
         Args:
             code: The Python code string to check.
@@ -279,69 +541,6 @@ class CodeQualityChecker:
         Returns:
             A dictionary with 'issues_found' (List[str]) and 'quality_score' (float).
         '''
-        logger.info("Checking Python code quality", code_length=len(code))
-        issues_found: List[str] = []
-        lines = code.splitlines()
-        num_lines = len(lines)
-
-        if num_lines == 0:
-            logger.warn("Attempted to check quality of empty Python code string.")
-            return {"issues_found": ["Code is empty."], "quality_score": 0.0}
-
-        # Check 1: "TODO" or "FIXME" comments
-        for i, line in enumerate(lines):
-            line_num = i + 1
-            if "TODO" in line or "FIXME" in line:
-                issues_found.append(f"Line {line_num}: Contains 'TODO' or 'FIXME'.")
-
-        # Check 2: Overly long lines
-        for i, line in enumerate(lines):
-            line_num = i + 1
-            if len(line) > self.max_line_length:
-                issues_found.append(f"Line {line_num}: Exceeds max line length of {self.max_line_length} (length: {len(line)}).")
-
-        # Check 3: Basic docstring checks using ast_analysis_results (if provided)
-        if ast_analysis_results:
-            if "functions" in ast_analysis_results:
-                for func_info in ast_analysis_results["functions"]:
-                    if not func_info.get("docstring_exists"):
-                        issues_found.append(f"Function '{func_info.get('name', 'N/A')}': Missing docstring.")
-
-            if "classes" in ast_analysis_results:
-                for class_info in ast_analysis_results["classes"]:
-                    if not class_info.get("docstring_exists"):
-                        issues_found.append(f"Class '{class_info.get('name', 'N/A')}': Missing docstring.")
-                    # Check methods within classes for docstrings
-                    for method_info in class_info.get("methods", []):
-                        # Skip __init__ for docstring check for simplicity, or apply different rule
-                        if method_info.get("name") == "__init__" and not method_info.get("docstring_exists"):
-                             # Could have a softer warning or ignore for __init__
-                             pass # issues_found.append(f"Method '{class_info.get('name')}.__init__': Missing docstring (optional but good practice).")
-                        elif method_info.get("name") != "__init__" and not method_info.get("docstring_exists"):
-                             issues_found.append(f"Method '{class_info.get('name', 'N/A')}.{method_info.get('name', 'N/A')}': Missing docstring.")
-        else:
-            logger.debug("AST analysis results not provided, skipping docstring checks.")
-
-        # Calculate a conceptual quality score
-        # Score starts at 1.0 and decreases for each issue. Max penalty per line for multiple issues on one line is avoided by this simple count.
-        # This is a very naive scoring mechanism.
-        quality_penalty = len(issues_found) * 0.1 # Penalize 0.1 for each issue
-        quality_score = max(0.0, 1.0 - quality_penalty)
-
-        # Alternative scoring: based on ratio of issues to lines
-        # if num_lines > 0:
-        #     quality_score = max(0.0, 1.0 - (len(issues_found) / num_lines))
-        # else:
-        #     quality_score = 0.0 if issues_found else 1.0
-
-
-        logger.info("Python code quality check complete.", num_issues=len(issues_found), quality_score=quality_score)
-        return {
-            "issues_found": issues_found,
-            "quality_score": quality_score
-        }
-
-# --- Main Code Generator Class ---
 
 class MultiLanguageCodeGenerator:
     '''

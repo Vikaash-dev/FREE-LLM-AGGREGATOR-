@@ -91,13 +91,13 @@ async def simulate_workflow(user_instruction: str):
     )
     logger.info("IntelligentResearchAssistant initialized for simulation (with Tavily-based WebResearcher).")
 
-    # Instantiate code generation components
-    # MultiLanguageCodeGenerator now internally instantiates BestPracticesDatabase, PythonAnalyzer, CodeQualityChecker
+    # MultiLanguageCodeGenerator now internally instantiates BestPracticesDatabase,
+    # PythonAnalyzer, and CodeQualityChecker (with Flake8).
     code_generator = MultiLanguageCodeGenerator(llm_aggregator=llm_aggregator)
-    logger.info("MultiLanguageCodeGenerator initialized (with internal BestPracticesDB, PyAnalyzer, QualityChecker).")
+    logger.info("MultiLanguageCodeGenerator initialized (with Flake8-enhanced QualityChecker).")
 
-    project_ctx = ProjectContext(project_name="EnhancedCodeGenSimProject",
-                                 project_description="Simulating Python code generation with best practices and enhanced quality checks.")
+    project_ctx = ProjectContext(project_name="ProdGradeCodeGenSimProject",
+                                 project_description="Simulating Python code generation with Flake8 checks.")
     current_plan: Optional[ExecutionPlan] = None
 
     try:
@@ -178,74 +178,98 @@ async def simulate_workflow(user_instruction: str):
                             task.reasoning_log.append(f"ResearchFailedError: {str(e_research)}")
                 # --- End Updated Research Logic ---
 
-                # ... (code generation trigger logic as before, no changes needed to this block itself) ...
-                needs_code_keywords = ["generate code", "write a script", "implement function", "create class", "python code for"]
+                # --- Updated Code Generation Trigger Logic & Enhanced Logging ---
+                generated_code_info: Optional[CodeGenerationResult] = None
+                needs_code_keywords = ["generate code", "write a script", "implement function", "create class", "python code for", "develop python"]
                 trigger_code_generation = any(kw in task.description.lower() for kw in needs_code_keywords)
 
-                generated_code_info: Optional[CodeGenerationResult] = None
                 if trigger_code_generation:
-                    logger.info("Task flagged for code generation.", task_id=task.task_id)
-                    # Create CodeSpecification from task details
+                    logger.info("Task flagged for Python code generation (with Flake8 quality checks).", task_id=task.task_id)
                     code_spec = CodeSpecification(
-                        target_language="python", # Hardcode to python for now
-                        prompt_details=task.description, # Use task description as main prompt
-                        context_summary=project_ctx.project_description, # Pass some context
-                        constraints=["Ensure the code is well-commented."] # Example constraint
+                        target_language="python",
+                        prompt_details=task.description,
+                        context_summary=project_ctx.project_description,
+                        constraints=["Ensure the code is robust. Follow Python best practices provided."]
                     )
                     try:
                         generated_code_info = await code_generator.generate_code(code_spec)
                         if generated_code_info and generated_code_info.succeeded:
-                            logger.info("Code generation successful for task.", task_id=task.task_id, code_length=len(generated_code_info.generated_code or ""), issues=len(generated_code_info.issues_found), score=generated_code_info.quality_score)
-                            task.reasoning_log.append(f"GeneratedCodeInfo: {generated_code_info.generated_code[:100] if generated_code_info.generated_code else 'N/A'}..., Issues: {generated_code_info.issues_found}, Score: {generated_code_info.quality_score}")
-                            task.output = generated_code_info.generated_code # Store generated code as task output
+                            # Count Flake8 and custom issues
+                            flake8_issue_count = sum(1 for issue in generated_code_info.issues_found if issue.get("type") == "flake8")
+                            custom_issue_count = sum(1 for issue in generated_code_info.issues_found if issue.get("type") == "custom")
+
+                            logger.info("Python code generation successful.",
+                                        task_id=task.task_id,
+                                        code_snippet=(generated_code_info.generated_code or "")[:150] + "...",
+                                        quality_score=generated_code_info.quality_score,
+                                        flake8_issues=flake8_issue_count,
+                                        custom_issues=custom_issue_count,
+                                        total_issues=len(generated_code_info.issues_found)
+                                        )
+                            if generated_code_info.issues_found:
+                                # Log all issues found, which are now dicts
+                                logger.warn("Quality issues found in generated code (Flake8 + custom):",
+                                            task_id=task.task_id,
+                                            num_issues=len(generated_code_info.issues_found),
+                                            issues=json.dumps(generated_code_info.issues_found, indent=2))
+
+                            task.reasoning_log.append(
+                                f"GeneratedCodeInfo: Score={generated_code_info.quality_score}, "
+                                f"NumIssues={len(generated_code_info.issues_found)}. Code: {(generated_code_info.generated_code or '')[:100]}..."
+                            )
+                            task.output = generated_code_info.generated_code
                         elif generated_code_info:
-                            logger.warn("Code generation attempt failed or had issues for task.", task_id=task.task_id, error=generated_code_info.error_message, issues=generated_code_info.issues_found)
-                            task.reasoning_log.append(f"CodeGenerationFailed: {generated_code_info.error_message}, Issues: {generated_code_info.issues_found}")
+                            logger.warn("Python code generation attempt failed or had issues.",
+                                        task_id=task.task_id,
+                                        error=generated_code_info.error_message,
+                                        num_issues=len(generated_code_info.issues_found),
+                                        # Log issues directly as they are now dicts
+                                        issues_found_details=json.dumps(generated_code_info.issues_found, indent=2),
+                                        score=generated_code_info.quality_score)
+                            task.reasoning_log.append(f"CodeGenerationFailed: {generated_code_info.error_message}, Issues: {len(generated_code_info.issues_found)}")
                             all_tasks_ultimately_successful = False
                     except Exception as e_codegen:
-                        logger.error("Error during code generation execution for task", task_id=task.task_id, error=str(e_codegen), exc_info=True)
+                        logger.error("Critical error during code generation call for task", task_id=task.task_id, error=str(e_codegen), exc_info=True)
                         task.reasoning_log.append(f"CodeGenSystemError: {str(e_codegen)}")
                         all_tasks_ultimately_successful = False
+                # --- End Updated Code Generation ---
 
-                # ... (task status update logic as before) ...
-                # Final decision for task status (simplified)
+                # ... (Task status update logic, adjusted for codegen success/failure) ...
                 if decision.get('action') == "PROCEED":
                     if trigger_code_generation and (not generated_code_info or not generated_code_info.succeeded):
-                        # If code gen was triggered but failed, task might not be "COMPLETED"
-                        task_status = TaskStatus.FAILED # Or CLARIFICATION_NEEDED if failure implies ambiguity
-                        task_message = "Code generation was required but failed or had issues."
+                        task_status = TaskStatus.FAILED
+                        task_message = "Code generation was required but failed or had significant quality issues."
                         all_tasks_ultimately_successful = False
                     else:
                         task_status = TaskStatus.COMPLETED
                         task_message = "Task simulated successfully."
-                        if research_data and research_data.get("knowledge_chunks"): task_message += f" (Research conducted)" # Check research_data for key
+                        if research_data and research_data.get("knowledge_chunks"): task_message += f" (Research conducted)"
                         if generated_code_info and generated_code_info.succeeded: task_message += " (Code generated)."
 
-                    task_result = TaskResult(task_id=task.task_id, status=task_status, message=task_message)
+                    task_result = TaskResult(task_id=task.task_id, status=task_status, message=task_message) # type: ignore
                     task.status = task_status # type: ignore
                     state_tracker.complete_task(current_plan.plan_id, task.task_id, task.status.value, task_result.message, output_summary=str(task.output)[:100] if task.output else None)
                 else: # NEEDS_CLARIFICATION
-                    task_result = TaskResult(task_id=task.task_id, status=TaskStatus.CLARIFICATION_NEEDED, message=decision.get('details'))
                     task.status = TaskStatus.CLARIFICATION_NEEDED # type: ignore
                     all_tasks_ultimately_successful = False
-                    state_tracker.complete_task(current_plan.plan_id, task.task_id, task.status.value, task_result.message)
+                    state_tracker.complete_task(current_plan.plan_id, task.task_id, task.status.value, decision.get('details'))
 
-            # Update overall plan status
-            if all_tasks_ultimately_successful and all(t.status == TaskStatus.COMPLETED for t in current_plan.tasks if t.status != TaskStatus.CLARIFICATION_NEEDED): # type: ignore
-                current_plan.overall_status = TaskStatus.COMPLETED # type: ignore
-            elif any(t.status == TaskStatus.FAILED for t in current_plan.tasks): # type: ignore
-                current_plan.overall_status = TaskStatus.FAILED # type: ignore
-            else: # If some need clarification or are pending
-                current_plan.overall_status = TaskStatus.CLARIFICATION_NEEDED # type: ignore
+            # ... (Overall plan status update as before) ...
+            if current_plan: # Ensure current_plan is not None
+                if all_tasks_ultimately_successful and all(t.status == TaskStatus.COMPLETED for t in current_plan.tasks if t.status != TaskStatus.CLARIFICATION_NEEDED):
+                    current_plan.overall_status = TaskStatus.COMPLETED # type: ignore
+                elif any(t.status == TaskStatus.FAILED for t in current_plan.tasks):
+                    current_plan.overall_status = TaskStatus.FAILED # type: ignore
+                else:
+                    current_plan.overall_status = TaskStatus.CLARIFICATION_NEEDED # type: ignore
+
 
         total_execution_time = time.monotonic() - start_time_total
-        if current_plan: # Ensure current_plan is not None
+        if current_plan:
             state_tracker.complete_plan(current_plan.plan_id, current_plan.overall_status.value, total_execution_time) # type: ignore
-            logger.info("Workflow simulation finished.", plan_id=current_plan.plan_id, overall_status=current_plan.overall_status.value, duration_seconds=round(total_execution_time,2)) # type: ignore
+            logger.info("Workflow simulation finished (Prod-Grade Python CodeGen).", plan_id=current_plan.plan_id, overall_status=current_plan.overall_status.value, duration_seconds=round(total_execution_time, 2)) # type: ignore
         else:
             logger.error("Simulation ended prematurely, no plan was fully created.")
-            # Log a generic plan failure if no plan was ever created.
-            state_tracker._log_event("plan_creation_failed", plan_id="unknown", task_id=None, details={"reason": "Execution plan object is None before completion."})
 
 
     except Exception as e:
@@ -261,21 +285,34 @@ async def simulate_workflow(user_instruction: str):
         logger.info("Simulation cleanup attempted (e.g., HTTP clients).")
 
 
-    # 6. Print session history from state tracker (optional)
-    logger.info("\n--- Simulation Event History ---")
-    for event in state_tracker.get_session_history():
-        # Convert entire event dict to string for a single log call, or let structlog handle dict.
-        logger.info("Event", **event) # Pass event dict as kwargs for structlog to expand
-    logger.info("--- End of Simulation Event History ---")
+        if 'web_researcher' in locals() and hasattr(web_researcher, 'close_client'):
+            await web_researcher.close_client()
+        logger.info("Simulation cleanup attempted.")
 
 
 if __name__ == "__main__":
-    sample_instruction = "Develop a Python script to analyze 'sales_data.csv', calculate total monthly sales, and generate a bar chart visualization. The script should handle potential errors in the CSV file."
+    if not settings.TAVILY_API_KEY:
+        logger.warn("TAVILY_API_KEY environment variable not set. Research functionality will be impacted.")
 
-    # More instructions for testing:
-    # sample_instruction = "Refactor the user authentication module to use OAuth2."
-    # sample_instruction = "Set up a new CI/CD pipeline for the web application project."
-    # sample_instruction = "What is the capital of France?" # Test a non-task based instruction
+    sample_instruction_flake8_test = """
+    Generate a Python script that does the following:
+    1. Defines a function `calculateSum` that takes two arguments `a` and `b` and returns their sum. (Use camelCase for function name for testing)
+    2. Defines a class `MyTestData` with a method `get_info` that returns a static string. (Method name also not snake_case for testing)
+    3. Has an unused import like `import os, sys`
+    4. Contains a line that is excessively long, over 100 characters: print('This is a very very very very very very very very very very very very very very very very very very very very long line of text for testing line length issues.')
+    5. Includes a TODO comment.
+    6. A function with no docstring: def no_doc_func(): pass
+    7. A function that is too long:
+    def very_long_function_example():
+        x = 1; print(x); x = 2; print(x); x = 3; print(x); x = 4; print(x); x = 5; print(x);
+        x = 1; print(x); x = 2; print(x); x = 3; print(x); x = 4; print(x); x = 5; print(x);
+        x = 1; print(x); x = 2; print(x); x = 3; print(x); x = 4; print(x); x = 5; print(x);
+        x = 1; print(x); x = 2; print(x); x = 3; print(x); x = 4; print(x); x = 5; print(x);
+        x = 1; print(x); x = 2; print(x); x = 3; print(x); x = 4; print(x); x = 5; print(x);
+        x = 1; print(x); x = 2; print(x); x = 3; print(x); x = 4; print(x); x = 5; print(x); # This will make it > 50 lines for CodeChecker
+    """
 
-    logger.info(f"Running simulation with instruction: '{sample_instruction}'")
-    asyncio.run(simulate_workflow(sample_instruction))
+    current_instruction_to_run = sample_instruction_flake8_test
+
+    logger.info(f"Running simulation with instruction: '{current_instruction_to_run}'")
+    asyncio.run(simulate_workflow(current_instruction_to_run))

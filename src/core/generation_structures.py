@@ -39,7 +39,7 @@ class CodeGenerationResult:
 
     # Optional fields for future enhancements (e.g., by CodeQualityChecker)
     quality_score: Optional[float] = None # e.g., 0.0 to 1.0
-    issues_found: List[str] = field(default_factory=list) # e.g., linting errors, style violations
+    issues_found: List[Dict[str, Any]] = field(default_factory=list) # Ensure this is List[Dict]
     suggestions: List[str] = field(default_factory=list) # e.g., for improvement
 
     error_message: Optional[str] = None # If generation failed
