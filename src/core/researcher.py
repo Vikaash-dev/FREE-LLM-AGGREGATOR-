@@ -7,7 +7,7 @@ from .aggregator import LLMAggregator
 from ..models import ChatCompletionRequest, Message as OpenHandsMessage # Ensure OpenHandsMessage alias
 
 # Import necessary structures
-from .research_structures import ProcessedResult, KnowledgeChunk, ResearchQuery, SearchResult # Added SearchResult
+from .research_structures import ProcessedResult, KnowledgeChunk, ResearchQuery, WebSearchResult, TavilySearchSessionReport # Updated imports
 from .research_components import ContextualKeywordExtractor, WebResearcher, RelevanceScorer
 
 
@@ -39,7 +39,7 @@ class IntelligentResearchAssistant:
         self.llm_aggregator = llm_aggregator # For synthesis
         logger.info("IntelligentResearchAssistant initialized with components.")
 
-    async def research_for_task(self, research_query: ResearchQuery) -> List[KnowledgeChunk]:
+    async def research_for_task(self, research_query: ResearchQuery) -> Dict[str, Any]:
         '''
         Main orchestration method for performing research for a given task query.
         It extracts keywords, performs (mock) web searches, scores relevance,
@@ -50,79 +50,88 @@ class IntelligentResearchAssistant:
                             context, and other parameters for research.
 
         Returns:
-            A list of KnowledgeChunk objects containing synthesized information,
-            or an empty list if research fails or yields no useful information.
+            A dictionary containing the 'session_report' (TavilySearchSessionReport),
+            'knowledge_chunks' (List[KnowledgeChunk]),
+            'processed_results_for_synthesis' (List[ProcessedResult]), and
+            'all_web_search_results' (List[WebSearchResult]).
         '''
-        logger.info("Starting research for task",
+        logger.info("Starting research for task with Tavily",
                     query_id=research_query.query_id,
-                    task_description_preview=research_query.original_task_description[:50])
+                    task_desc_preview=research_query.original_task_description[:100])
 
-        # Step 1: Extract Keywords
-        logger.debug("Extracting keywords...", query_id=research_query.query_id)
-        # Keywords were already extracted and placed in research_query if called from simulation script
-        # If research_query.keywords is empty, then call extractor.
-        if not research_query.keywords:
+        final_output: Dict[str, Any] = {
+            "session_report": None,
+            "knowledge_chunks": [],
+            "processed_results_for_synthesis": [],
+            "all_web_search_results": []
+        }
+
+        query_for_tavily = research_query.original_task_description
+        if not query_for_tavily.strip() and research_query.keywords:
+            logger.info("Original task description empty, using keywords for Tavily query.", query_id=research_query.query_id)
+            query_for_tavily = " ".join(research_query.keywords)
+
+        if not query_for_tavily.strip():
+            logger.info("No direct query for Tavily, attempting keyword extraction.", query_id=research_query.query_id)
             extracted_keywords = await self.keyword_extractor.extract(
-                task_description=research_query.original_task_description,
+                task_description=research_query.original_task_description, # This might be empty
                 project_context_summary=research_query.project_context_summary
             )
-            if not extracted_keywords:
-                logger.warn("No keywords extracted. Research cannot proceed effectively.", query_id=research_query.query_id)
-                return []
-            research_query.keywords = extracted_keywords
+            if extracted_keywords:
+                research_query.keywords = extracted_keywords
+                query_for_tavily = " ".join(extracted_keywords)
+                logger.info("Using extracted keywords as Tavily query", keywords=extracted_keywords, query_id=research_query.query_id)
+            else:
+                logger.warn("No valid query constructible for Tavily search.", query_id=research_query.query_id)
+                final_output["session_report"] = TavilySearchSessionReport(query_echo=query_for_tavily or research_query.original_task_description, num_results_returned=0, session_metadata={"error": "No query constructible"})
+                return final_output
 
-        logger.info("Keywords for research", keywords=research_query.keywords, query_id=research_query.query_id)
-
-
-        # Step 2: Search (using WebResearcher with mock content)
-        logger.debug("Performing (mock) web search with extracted keywords...", query_id=research_query.query_id)
-        # Type hint for search_results_raw should be List[SearchResult]
-        search_results_raw: List[SearchResult] = await self.web_researcher.search(research_query.keywords)
-        if not search_results_raw:
-            logger.warn("No search results obtained from WebResearcher.", keywords=research_query.keywords, query_id=research_query.query_id)
-            return [] # If no raw results, can't proceed.
-        logger.info("Mock search complete", num_raw_results=len(search_results_raw), query_id=research_query.query_id)
-
-        # Step 3: Score Relevance
-        logger.debug("Scoring relevance of search results...", query_id=research_query.query_id)
-        # Type hint for processed_results should be List[ProcessedResult]
-        processed_results: List[ProcessedResult] = await self.relevance_scorer.score(
-            search_results_raw,
-            research_query.original_task_description,
-            self.web_researcher # Pass the web_researcher instance
+        logger.debug("Performing search with Tavily...", query_id=research_query.query_id, tavily_query=query_for_tavily)
+        # Tavily specific parameters can be passed here from research_query if added to its structure
+        tavily_search_response = await self.web_researcher.search_with_tavily(
+            query=query_for_tavily,
+            search_depth="basic", # Example, could be from research_query
+            max_results=7,       # Example
+            include_answer=True  # Example
         )
-        # Note: relevance_scorer.score might return empty list if all content fetching failed or other issues.
-        # We don't necessarily stop if processed_results is empty, as synthesize_research can handle it.
 
-        # Filter for relevant results before synthesis
-        relevant_results = [res for res in processed_results if res.relevance_score >= 0.5 and not res.error_fetching]
-        if not relevant_results:
-            logger.warn("No sufficiently relevant results after scoring for synthesis (or all failed fetching).", query_id=research_query.query_id, num_processed_results=len(processed_results))
-            # Return an empty list or a KnowledgeChunk indicating no relevant info found.
-            # For consistency with synthesize_research, let it decide.
-            # However, if all failed fetching, it's good to know.
-            if processed_results and all(res.error_fetching for res in processed_results):
-                 return [KnowledgeChunk(content=f"Failed to fetch content for all {len(processed_results)} search results for query: {research_query.original_task_description[:30]}...", source_result_ids=[])]
+        final_output["session_report"] = tavily_search_response["report"]
+        tavily_web_search_results: List[WebSearchResult] = tavily_search_response["results"]
+        final_output["all_web_search_results"] = tavily_web_search_results
 
+        if not tavily_web_search_results:
+            logger.warn("No search results (URLs) obtained from Tavily.", query_id=research_query.query_id)
+            return final_output # Session report is still returned
+        logger.info("Tavily search yielded results", num_results=len(tavily_web_search_results), query_id=research_query.query_id)
 
-        logger.info("Relevance scoring complete", num_processed_results=len(processed_results), num_relevant_for_synthesis=len(relevant_results), query_id=research_query.query_id)
+        logger.debug("Locally scoring relevance of Tavily's search results...", query_id=research_query.query_id)
+        locally_processed_results: List[ProcessedResult] = await self.relevance_scorer.score(
+            tavily_web_search_results, # These are List[WebSearchResult]
+            research_query.original_task_description,
+            self.web_researcher
+        )
 
+        relevant_for_synthesis = [res for res in locally_processed_results if res.local_relevance_score is not None and res.local_relevance_score >= 0.5 and not res.error_processing]
+        final_output["processed_results_for_synthesis"] = relevant_for_synthesis
 
-        # Step 4: Synthesize Knowledge
-        logger.debug("Synthesizing knowledge from relevant results...", query_id=research_query.query_id)
+        if not relevant_for_synthesis:
+            logger.warn("No sufficiently relevant results after local scoring for synthesis.", query_id=research_query.query_id)
+            return final_output # Session report and raw results are still returned
+        logger.info("Local relevance scoring complete", num_relevant_for_synthesis=len(relevant_for_synthesis), query_id=research_query.query_id)
+
+        logger.debug("Synthesizing knowledge...", query_id=research_query.query_id)
         synthesized_knowledge: List[KnowledgeChunk] = await self.synthesize_research(
-            relevant_results, # Pass only relevant results
+            relevant_for_synthesis,
             original_query=research_query
         )
-        # synthesize_research handles empty relevant_results and may return a specific chunk.
+        final_output["knowledge_chunks"] = synthesized_knowledge
 
-        if not synthesized_knowledge or (len(synthesized_knowledge) == 1 and "No specific information found" in synthesized_knowledge[0].content) :
-            logger.warn("Knowledge synthesis yielded no substantial chunks or only an 'info not found' chunk.", query_id=research_query.query_id)
-            # We might still return the "info not found" chunk.
+        if synthesized_knowledge: # Check if list is not empty
+            logger.info("Research complete. Knowledge chunks synthesized.", num_chunks=len(synthesized_knowledge), query_id=research_query.query_id)
+        else: # This condition might be hit if synthesize_research returns empty or "no info" chunk based on its internal logic
+            logger.warn("Knowledge synthesis yielded no substantial chunks, though relevant items were found.", query_id=research_query.query_id)
 
-        logger.info("Research for task complete. Knowledge chunks synthesized.",
-                    num_chunks=len(synthesized_knowledge), query_id=research_query.query_id)
-        return synthesized_knowledge
+        return final_output
 
     async def synthesize_research(self, processed_results: List[ProcessedResult], original_query: Optional[ResearchQuery] = None, max_results_to_synthesize: int = 3) -> List[KnowledgeChunk]:
         '''

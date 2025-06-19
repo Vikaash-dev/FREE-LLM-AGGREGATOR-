@@ -53,3 +53,4 @@ lxml>=4.9.0
 # Enhanced research features
 torch>=2.0.0
 numpy>=1.24.0
+tavily-python>=0.3.3

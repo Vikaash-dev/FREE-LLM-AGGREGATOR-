@@ -31,13 +31,17 @@ from models import ProviderConfig as OpenHandsProviderConfig, ProviderStatus
 # Import IntelligentResearchAssistant and its components, and ResearchQuery
 from core.researcher import IntelligentResearchAssistant
 from core.research_components import ContextualKeywordExtractor, WebResearcher, RelevanceScorer
-from core.research_structures import ResearchQuery, KnowledgeChunk # KnowledgeChunk for type hint
+from core.research_structures import ResearchQuery, KnowledgeChunk, WebSearchResult, TavilySearchSessionReport # Added WebSearchResult, TavilySearchSessionReport
 
 # Import new/updated components for code generation
 from core.code_generator import MultiLanguageCodeGenerator
 from core.generation_structures import CodeSpecification, CodeGenerationResult # CodeGenerationResult for type hint
-from core.planning_structures import Task # Task needed for type hint
+from core.planning_structures import Task, ExecutionPlan # Added ExecutionPlan for type hint
 import httpx # Import httpx for the shared client
+import json # For pretty printing dicts
+
+# Settings to get TAVILY_API_KEY
+from config import settings
 
 
 logger = structlog.get_logger(__name__)
@@ -46,174 +50,215 @@ async def simulate_workflow(user_instruction: str):
     '''
     Simulates the core planning and reasoning workflow.
     '''
-    logger.info("Starting planning workflow simulation with live research and enhanced code gen", instruction=user_instruction)
+    logger.info("Starting planning workflow simulation with Tavily research and enhanced code gen", instruction=user_instruction)
     start_time_total = time.monotonic()
 
-    # --- Shared HTTP Client for components that need it ---
-    async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as shared_http_client:
-        logger.info("Shared httpx.AsyncClient initialized.")
+    logger.info("Starting planning workflow simulation with Tavily research and enhanced code gen", instruction=user_instruction)
+    start_time_total = time.monotonic()
 
-        # --- Simplified Setup for LLMAggregator ---
-        try:
-            account_manager = AccountManager()
-            mock_provider_configs = {"mock_provider_1": OpenHandsProviderConfig(name="mock_provider_1", status=ProviderStatus.ACTIVE, models=[], credentials=[])} # type: ignore
-            router = ProviderRouter(provider_configs=mock_provider_configs)
-            rate_limiter = RateLimiter()
-            llm_aggregator = LLMAggregator(providers=[], account_manager=account_manager, router=router, rate_limiter=rate_limiter)
-            logger.info("LLMAggregator initialized for simulation (with no actual providers).")
-        except Exception as e:
-            logger.error("Failed to initialize LLMAggregator and its dependencies", error=str(e), exc_info=True)
-            # Ensure shared_http_client is closed if it was opened before this error.
-            # However, it's managed by async with, so it will be handled.
-            return
-        # --- End Simplified Setup ---
+    # Load Tavily API Key from settings
+    tavily_api_key = settings.TAVILY_API_KEY
+    if not tavily_api_key:
+        logger.warn("TAVILY_API_KEY not found in environment/settings. Tavily search will likely fail or be skipped.")
 
-        # Instantiate core components
-        planner = DevikaInspiredPlanner(llm_aggregator=llm_aggregator)
-        reasoner = ContextualReasoningEngine(llm_aggregator=llm_aggregator)
-        state_tracker = StateTracker()
+    # --- Simplified Setup for LLMAggregator ---
+    try:
+        account_manager = AccountManager()
+        mock_provider_configs = {"mock_provider_1": OpenHandsProviderConfig(name="mock_provider_1", status=ProviderStatus.ACTIVE, models=[], credentials=[])} # type: ignore
+        router = ProviderRouter(provider_configs=mock_provider_configs)
+        rate_limiter = RateLimiter()
+        llm_aggregator = LLMAggregator(providers=[], account_manager=account_manager, router=router, rate_limiter=rate_limiter)
+        logger.info("LLMAggregator initialized for simulation (with no actual providers).")
+    except Exception as e:
+        logger.error("Failed to initialize LLMAggregator and its dependencies", error=str(e), exc_info=True)
+        return
+    # --- End Simplified Setup ---
 
-        # Instantiate research components with shared client
-        keyword_extractor = ContextualKeywordExtractor(llm_aggregator=llm_aggregator)
-        web_researcher = WebResearcher(http_client=shared_http_client)
-        relevance_scorer = RelevanceScorer(llm_aggregator=llm_aggregator)
-        research_assistant = IntelligentResearchAssistant(
-            keyword_extractor=keyword_extractor,
-            web_researcher=web_researcher,
-            relevance_scorer=relevance_scorer,
-            llm_aggregator=llm_aggregator
-        )
-        logger.info("IntelligentResearchAssistant initialized for simulation (with live WebResearcher).")
+    # Instantiate core components
+    planner = DevikaInspiredPlanner(llm_aggregator=llm_aggregator)
+    reasoner = ContextualReasoningEngine(llm_aggregator=llm_aggregator)
+    state_tracker = StateTracker()
 
-        # Instantiate code generation components
-        code_generator = MultiLanguageCodeGenerator(llm_aggregator=llm_aggregator)
-        logger.info("MultiLanguageCodeGenerator initialized for simulation.")
+    # Instantiate research components
+    keyword_extractor = ContextualKeywordExtractor(llm_aggregator=llm_aggregator)
+    web_researcher = WebResearcher(tavily_api_key=tavily_api_key or "NO_KEY_PROVIDED_SIMULATION")
+    relevance_scorer = RelevanceScorer(llm_aggregator=llm_aggregator)
+    research_assistant = IntelligentResearchAssistant(
+        keyword_extractor=keyword_extractor,
+        web_researcher=web_researcher,
+        relevance_scorer=relevance_scorer,
+        llm_aggregator=llm_aggregator
+    )
+    logger.info("IntelligentResearchAssistant initialized for simulation (with Tavily-based WebResearcher).")
+
+    # Instantiate code generation components
+    # MultiLanguageCodeGenerator now internally instantiates BestPracticesDatabase, PythonAnalyzer, CodeQualityChecker
+    code_generator = MultiLanguageCodeGenerator(llm_aggregator=llm_aggregator)
+    logger.info("MultiLanguageCodeGenerator initialized (with internal BestPracticesDB, PyAnalyzer, QualityChecker).")
+
+    project_ctx = ProjectContext(project_name="EnhancedCodeGenSimProject",
+                                 project_description="Simulating Python code generation with best practices and enhanced quality checks.")
+    current_plan: Optional[ExecutionPlan] = None
+
+    try:
+        # ... (Intent Parsing and Task Decomposition as before) ...
+        logger.info("Step 1: Parsing user intent...")
+        parsed_intent = await planner.parse_user_intent(user_instruction, context=project_ctx)
+
+        logger.info("Step 2: Decomposing task into execution plan...")
+        current_plan = await planner.decompose_complex_task(parsed_intent, context=project_ctx)
+        state_tracker.start_plan(current_plan.plan_id, user_instruction, len(current_plan.tasks))
 
 
-        project_ctx = ProjectContext(project_name="LiveSimProject", project_description="Project simulating live research and enhanced code gen.")
-        current_plan: Optional[Any] = None # ExecutionPlan is defined in planning_structures, but using Any for flexibility here
+        if not current_plan.tasks:
+            # ... (handling of no tasks as before) ...
+            logger.warn("No tasks generated in the execution plan.", plan_id=current_plan.plan_id)
+            current_plan.overall_status = TaskStatus.COMPLETED # type: ignore
+        else:
+            logger.info(f"Step 3: Processing {len(current_plan.tasks)} tasks in the plan...", plan_id=current_plan.plan_id)
+            all_tasks_ultimately_successful = True
 
-        try:
-            logger.info("Step 1: Parsing user intent...")
-            parsed_intent = await planner.parse_user_intent(user_instruction, context=project_ctx)
+            for task_index, task in enumerate(current_plan.tasks):
+                # ... (task processing setup: logging, state_tracker.start_task, status update) ...
+                logger.info(f"Processing task {task_index + 1}/{len(current_plan.tasks)}", task_id=task.task_id, description=task.description)
+                state_tracker.start_task(current_plan.plan_id, task.task_id, task.description, task.dependencies)
+                task.status = TaskStatus.IN_PROGRESS # type: ignore
 
-            logger.info("Step 2: Decomposing task into execution plan...")
-            current_plan = await planner.decompose_complex_task(parsed_intent, context=project_ctx)
-            state_tracker.start_plan(current_plan.plan_id, user_instruction, len(current_plan.tasks))
+                # ... (Context Analysis, Reasoning, Decision Making as before) ...
+                analyzed_context = await reasoner.analyze_context(task, project_context=project_ctx)
+                reasoning_output = await reasoner.reason_about_task(task, analyzed_context)
+                decision = reasoner.make_decision(reasoning_output)
+                state_tracker.update_task_reasoning(current_plan.plan_id, task.task_id, decision)
+                task.reasoning_log.append(f"InitialReasoning: {decision}")
 
-            if not current_plan.tasks:
-                logger.warn("No tasks generated in the execution plan.", plan_id=current_plan.plan_id)
-                current_plan.overall_status = TaskStatus.COMPLETED
-            else:
-                logger.info(f"Step 3: Processing {len(current_plan.tasks)} tasks in the plan...", plan_id=current_plan.plan_id)
-                all_tasks_ultimately_successful = True
 
-                for task_index, task in enumerate(current_plan.tasks):
-                    logger.info(f"Processing task {task_index + 1}/{len(current_plan.tasks)}", task_id=task.task_id, description=task.description)
-                    state_tracker.start_task(current_plan.plan_id, task.task_id, task.description, task.dependencies)
-                    task.status = TaskStatus.IN_PROGRESS
-
-                    analyzed_context = await reasoner.analyze_context(task, project_context=project_ctx)
-                    reasoning_output = await reasoner.reason_about_task(task, analyzed_context)
-                    decision = reasoner.make_decision(reasoning_output)
-                    state_tracker.update_task_reasoning(current_plan.plan_id, task.task_id, decision)
-                    task.reasoning_log.append(f"InitialReasoning: {decision}")
-
-                    task_knowledge_chunks: List[KnowledgeChunk] = []
-                    needs_research_keywords = ["research", "find information", "investigate", "what is", "how to", "learn about", "explore"]
-                    trigger_research = any(kw in task.description.lower() for kw in needs_research_keywords) or \
-                                       (decision.get('action') == "NEEDS_CLARIFICATION" and decision.get('confidence', 1.0) < 0.7)
-
-                    if trigger_research:
-                        logger.info("Task flagged for live research, invoking IntelligentResearchAssistant.", task_id=task.task_id)
+                # --- Updated Research Trigger Logic & Logging ---
+                research_data: Optional[Dict[str, Any]] = None
+                needs_research_keywords = ["research", "find information", "investigate", "what is", "how to", "learn about", "explore", "tavily search for"]
+                trigger_research = any(kw in task.description.lower() for kw in needs_research_keywords) or \
+                                   (decision.get('action') == "NEEDS_CLARIFICATION" and decision.get('confidence', 1.0) < 0.7)
+                if trigger_research:
+                    if not tavily_api_key:
+                        logger.error("Skipping research: TAVILY_API_KEY is not set.", task_id=task.task_id)
+                        task.reasoning_log.append("ResearchSkipped: TAVILY_API_KEY missing.")
+                    else:
+                        logger.info("Task flagged for research with Tavily, invoking IntelligentResearchAssistant.", task_id=task.task_id)
                         project_summary_for_research = project_ctx.project_description if project_ctx else None
                         current_research_query = ResearchQuery(
-                            original_task_description=task.description,
+                            original_task_description=task.description, # Or task.raw_instruction or combined
                             project_context_summary=project_summary_for_research
                         )
                         try:
-                            task_knowledge_chunks = await research_assistant.research_for_task(current_research_query)
-                            if task_knowledge_chunks:
-                                logger.info("Live research completed, knowledge chunks obtained.", task_id=task.task_id, num_chunks=len(task_knowledge_chunks))
-                                task.reasoning_log.append(f"Research Chunks: {[chunk.content for chunk in task_knowledge_chunks]}")
-                            else:
-                                logger.info("Live research completed, but no knowledge chunks were synthesized.", task_id=task.task_id)
+                            research_data = await research_assistant.research_for_task(current_research_query)
+
+                            if research_data:
+                                tav_report: Optional[TavilySearchSessionReport] = research_data.get("session_report")
+                                k_chunks: List[KnowledgeChunk] = research_data.get("knowledge_chunks", [])
+                                all_web_res: List[WebSearchResult] = research_data.get("all_web_search_results", [])
+                                processed_for_synth: List[ProcessedResult] = research_data.get("processed_results_for_synthesis", []) # type: ignore
+
+                                if tav_report:
+                                    logger.info("Tavily research session report",
+                                                query_echo=tav_report.query_echo,
+                                                answer=tav_report.overall_answer,
+                                                num_raw_tavily_results=tav_report.num_results_returned,
+                                                session_metadata=tav_report.session_metadata)
+
+                                if k_chunks:
+                                    logger.info("Research completed, knowledge chunks obtained.",
+                                                task_id=task.task_id, num_chunks=len(k_chunks))
+                                    task.reasoning_log.append(f"KnowledgeChunks: {[chunk.content for chunk in k_chunks]}")
+                                    if processed_for_synth:
+                                        log_synth_sources = [{"url": pr.source_web_search_result.url, "local_score": pr.local_relevance_score, "original_score": pr.source_web_search_result.score} for pr in processed_for_synth]
+                                        logger.debug("Sources for synthesis", sources_count=len(log_synth_sources) ,sources_preview=json.dumps(log_synth_sources[:2], indent=2)) # Log first 2
+                                else:
+                                    logger.info("Research completed, but no knowledge chunks were synthesized.", task_id=task.task_id)
                         except Exception as e_research:
-                            logger.error("Error during live research execution for task", task_id=task.task_id, error=str(e_research), exc_info=True)
+                            logger.error("Error during Tavily research execution for task", task_id=task.task_id, error=str(e_research), exc_info=True)
                             task.reasoning_log.append(f"ResearchFailedError: {str(e_research)}")
+                # --- End Updated Research Logic ---
 
-                    needs_code_keywords = ["generate code", "write a script", "implement function", "create class", "python code for"]
-                    trigger_code_generation = any(kw in task.description.lower() for kw in needs_code_keywords)
+                # ... (code generation trigger logic as before, no changes needed to this block itself) ...
+                needs_code_keywords = ["generate code", "write a script", "implement function", "create class", "python code for"]
+                trigger_code_generation = any(kw in task.description.lower() for kw in needs_code_keywords)
 
-                    generated_code_info: Optional[CodeGenerationResult] = None
-                    if trigger_code_generation:
-                        logger.info("Task flagged for code generation.", task_id=task.task_id)
-                        code_spec = CodeSpecification(
-                            target_language="python",
-                            prompt_details=task.description,
-                            context_summary=project_ctx.project_description,
-                            constraints=["Ensure the code is well-commented."]
-                        )
-                        try:
-                            generated_code_info = await code_generator.generate_code(code_spec)
-                            if generated_code_info and generated_code_info.succeeded:
-                                logger.info("Code generation successful for task.", task_id=task.task_id, code_length=len(generated_code_info.generated_code or ""), issues=len(generated_code_info.issues_found), score=generated_code_info.quality_score)
-                                task.reasoning_log.append(f"GeneratedCodeInfo: {generated_code_info.generated_code[:100] if generated_code_info.generated_code else 'N/A'}..., Issues: {generated_code_info.issues_found}, Score: {generated_code_info.quality_score}")
-                                task.output = generated_code_info.generated_code
-                            elif generated_code_info:
-                                logger.warn("Code generation attempt failed or had issues for task.", task_id=task.task_id, error=generated_code_info.error_message, issues=generated_code_info.issues_found)
-                                task.reasoning_log.append(f"CodeGenerationFailed: {generated_code_info.error_message}, Issues: {generated_code_info.issues_found}")
-                                all_tasks_ultimately_successful = False
-                        except Exception as e_codegen:
-                            logger.error("Error during code generation execution for task", task_id=task.task_id, error=str(e_codegen), exc_info=True)
-                            task.reasoning_log.append(f"CodeGenSystemError: {str(e_codegen)}")
+                generated_code_info: Optional[CodeGenerationResult] = None
+                if trigger_code_generation:
+                    logger.info("Task flagged for code generation.", task_id=task.task_id)
+                    # Create CodeSpecification from task details
+                    code_spec = CodeSpecification(
+                        target_language="python", # Hardcode to python for now
+                        prompt_details=task.description, # Use task description as main prompt
+                        context_summary=project_ctx.project_description, # Pass some context
+                        constraints=["Ensure the code is well-commented."] # Example constraint
+                    )
+                    try:
+                        generated_code_info = await code_generator.generate_code(code_spec)
+                        if generated_code_info and generated_code_info.succeeded:
+                            logger.info("Code generation successful for task.", task_id=task.task_id, code_length=len(generated_code_info.generated_code or ""), issues=len(generated_code_info.issues_found), score=generated_code_info.quality_score)
+                            task.reasoning_log.append(f"GeneratedCodeInfo: {generated_code_info.generated_code[:100] if generated_code_info.generated_code else 'N/A'}..., Issues: {generated_code_info.issues_found}, Score: {generated_code_info.quality_score}")
+                            task.output = generated_code_info.generated_code # Store generated code as task output
+                        elif generated_code_info:
+                            logger.warn("Code generation attempt failed or had issues for task.", task_id=task.task_id, error=generated_code_info.error_message, issues=generated_code_info.issues_found)
+                            task.reasoning_log.append(f"CodeGenerationFailed: {generated_code_info.error_message}, Issues: {generated_code_info.issues_found}")
                             all_tasks_ultimately_successful = False
-
-
-                    if decision.get('action') == "PROCEED":
-                        if trigger_code_generation and (not generated_code_info or not generated_code_info.succeeded):
-                            task_status = TaskStatus.FAILED
-                            task_message = "Code generation was required but failed or had issues."
-                            all_tasks_ultimately_successful = False
-                        else:
-                            task_status = TaskStatus.COMPLETED
-                            task_message = "Task simulated successfully."
-                            if task_knowledge_chunks: task_message += f" (Research found {len(task_knowledge_chunks)} chunks)."
-                            if generated_code_info and generated_code_info.succeeded: task_message += " (Code generated)."
-
-                        task_result = TaskResult(task_id=task.task_id, status=task_status, message=task_message)
-                        task.status = task_status
-                        state_tracker.complete_task(current_plan.plan_id, task.task_id, task.status.value, task_result.message, output_summary=str(task.output)[:100] if task.output else None)
-                    else:
-                        task_result = TaskResult(task_id=task.task_id, status=TaskStatus.CLARIFICATION_NEEDED, message=decision.get('details'))
-                        task.status = TaskStatus.CLARIFICATION_NEEDED
+                    except Exception as e_codegen:
+                        logger.error("Error during code generation execution for task", task_id=task.task_id, error=str(e_codegen), exc_info=True)
+                        task.reasoning_log.append(f"CodeGenSystemError: {str(e_codegen)}")
                         all_tasks_ultimately_successful = False
-                        state_tracker.complete_task(current_plan.plan_id, task.task_id, task.status.value, task_result.message)
 
-                if all_tasks_ultimately_successful and all(t.status == TaskStatus.COMPLETED for t in current_plan.tasks if t.status != TaskStatus.CLARIFICATION_NEEDED):
-                    current_plan.overall_status = TaskStatus.COMPLETED
-                elif any(t.status == TaskStatus.FAILED for t in current_plan.tasks):
-                    current_plan.overall_status = TaskStatus.FAILED
-                else:
-                    current_plan.overall_status = TaskStatus.CLARIFICATION_NEEDED
+                # ... (task status update logic as before) ...
+                # Final decision for task status (simplified)
+                if decision.get('action') == "PROCEED":
+                    if trigger_code_generation and (not generated_code_info or not generated_code_info.succeeded):
+                        # If code gen was triggered but failed, task might not be "COMPLETED"
+                        task_status = TaskStatus.FAILED # Or CLARIFICATION_NEEDED if failure implies ambiguity
+                        task_message = "Code generation was required but failed or had issues."
+                        all_tasks_ultimately_successful = False
+                    else:
+                        task_status = TaskStatus.COMPLETED
+                        task_message = "Task simulated successfully."
+                        if research_data and research_data.get("knowledge_chunks"): task_message += f" (Research conducted)" # Check research_data for key
+                        if generated_code_info and generated_code_info.succeeded: task_message += " (Code generated)."
 
-            total_execution_time = time.monotonic() - start_time_total
-            if current_plan: # Ensure current_plan is not None
-                state_tracker.complete_plan(current_plan.plan_id, current_plan.overall_status.value, total_execution_time)
-                logger.info("Workflow simulation finished.", plan_id=current_plan.plan_id, overall_status=current_plan.overall_status.value, duration_seconds=round(total_execution_time,2))
-            else: # Should not happen if decomposition was successful
-                logger.error("Execution plan is None at the end of simulation. This should not happen if decomposition succeeded.")
-                state_tracker._log_event("plan_failed", "unknown_plan_id_at_completion", None, {"reason": "Execution plan object was None."})
+                    task_result = TaskResult(task_id=task.task_id, status=task_status, message=task_message)
+                    task.status = task_status # type: ignore
+                    state_tracker.complete_task(current_plan.plan_id, task.task_id, task.status.value, task_result.message, output_summary=str(task.output)[:100] if task.output else None)
+                else: # NEEDS_CLARIFICATION
+                    task_result = TaskResult(task_id=task.task_id, status=TaskStatus.CLARIFICATION_NEEDED, message=decision.get('details'))
+                    task.status = TaskStatus.CLARIFICATION_NEEDED # type: ignore
+                    all_tasks_ultimately_successful = False
+                    state_tracker.complete_task(current_plan.plan_id, task.task_id, task.status.value, task_result.message)
+
+            # Update overall plan status
+            if all_tasks_ultimately_successful and all(t.status == TaskStatus.COMPLETED for t in current_plan.tasks if t.status != TaskStatus.CLARIFICATION_NEEDED): # type: ignore
+                current_plan.overall_status = TaskStatus.COMPLETED # type: ignore
+            elif any(t.status == TaskStatus.FAILED for t in current_plan.tasks): # type: ignore
+                current_plan.overall_status = TaskStatus.FAILED # type: ignore
+            else: # If some need clarification or are pending
+                current_plan.overall_status = TaskStatus.CLARIFICATION_NEEDED # type: ignore
+
+        total_execution_time = time.monotonic() - start_time_total
+        if current_plan: # Ensure current_plan is not None
+            state_tracker.complete_plan(current_plan.plan_id, current_plan.overall_status.value, total_execution_time) # type: ignore
+            logger.info("Workflow simulation finished.", plan_id=current_plan.plan_id, overall_status=current_plan.overall_status.value, duration_seconds=round(total_execution_time,2)) # type: ignore
+        else:
+            logger.error("Simulation ended prematurely, no plan was fully created.")
+            # Log a generic plan failure if no plan was ever created.
+            state_tracker._log_event("plan_creation_failed", plan_id="unknown", task_id=None, details={"reason": "Execution plan object is None before completion."})
 
 
-        except Exception as e:
-            logger.error("Critical error during workflow simulation", error=str(e), exc_info=True)
-            if current_plan and current_plan.plan_id:
-                 state_tracker.complete_plan(current_plan.plan_id, TaskStatus.FAILED.value, time.monotonic() - start_time_total)
-        finally:
+    except Exception as e:
+        logger.error("Critical error during workflow simulation", error=str(e), exc_info=True)
+        if current_plan and current_plan.plan_id:
+             state_tracker.complete_plan(current_plan.plan_id, TaskStatus.FAILED.value, time.monotonic() - start_time_total)
+    finally:
+        # Close WebResearcher's http_client if it has one and it was created by WebResearcher
+        # The current WebResearcher init takes an API key and creates its own clients.
+        # It has a close_client method for its httpx client.
+        if 'web_researcher' in locals() and hasattr(web_researcher, 'close_client'):
             await web_researcher.close_client()
-            # await llm_aggregator.close() # Consider if llm_aggregator needs explicit closing
-            logger.info("Shared httpx.AsyncClient and other resources closed/handled.")
+        logger.info("Simulation cleanup attempted (e.g., HTTP clients).")
 
 
     # 6. Print session history from state tracker (optional)

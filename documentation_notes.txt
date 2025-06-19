@@ -3,21 +3,7 @@
 The following updates should be incorporated into `README.md` or a new `FEATURES.md` file:
 
 ### New Dependencies:
-- `httpx`: For making asynchronous HTTP requests (used by WebResearcher).
-- `beautifulsoup4`: For parsing HTML content (used by WebResearcher).
-Ensure these are listed in `requirements.txt`.
-
-### Enhanced Research Capabilities:
-- **Live Web Research (`WebResearcher`):**
-  - The system can now perform basic live web searches (currently by constructing Google search URLs) to find relevant URLs.
-  - It can fetch content from these URLs and parse HTML to extract textual information using `BeautifulSoup`.
-  - **Limitations:**
-    - Direct Google search URL construction and parsing is fragile and may be blocked or yield inconsistent results. A proper Search API key (e.g., Google Custom Search JSON API, SerpApi) is recommended for robust production use but is not integrated by default to keep setup simple.
-    - JavaScript-rendered content may not be fully captured as it relies on static HTML parsing.
-- **Relevance Scoring (`RelevanceScorer`):**
-  - Fetched web content is scored for relevance against the research task using an LLM.
-- **Keyword Extraction & Synthesis:**
-  - These features (from Phase 2, Steps 3 & 6) remain, now operating on potentially live web data.
+(This section can be merged or kept if other non-Tavily/non-httpx dependencies are noted elsewhere. For now, the new section below covers httpx, beautifulsoup4, and tavily-python)
 
 ### Enhanced Python Code Generation (`MultiLanguageCodeGenerator`):
 - **LLM-Based Generation:** Python code is generated using an LLM based on detailed specifications.
@@ -37,3 +23,65 @@ Ensure these are listed in `requirements.txt`.
 
 ### Simulation Script:
 - `run_planning_simulation.py` has been updated to demonstrate these new live research and enhanced Python code generation capabilities. Note that live web requests can make the simulation slower and dependent on network connectivity.
+
+## Enhanced Web Research with Tavily AI Integration (Update to Previous Research Section)
+
+The `WebResearcher` component has been significantly updated to use **Tavily AI** as its primary engine for web searches, replacing the previous basic Google search scraping method. This provides more robust, relevant, and semantically rich search results.
+
+### Key Changes & Features:
+-   **Primary Search Engine:** Tavily AI is now used for performing searches via the `WebResearcher.search_with_tavily()` method. This method leverages Tavily's capabilities for context-aware searching and often returns processed summaries along with source URLs.
+-   **New Dependencies (ensure these are in `requirements.txt`):**
+    -   `tavily-python`: Client library for interacting with the Tavily AI search API.
+    -   `httpx`: For making asynchronous HTTP requests (used by `WebResearcher` for fetching full content from URLs provided by Tavily or other sources).
+    -   `beautifulsoup4`: For parsing HTML content (used by `WebResearcher` for extracting text from fetched pages).
+-   **API Key Configuration:**
+    -   A **`TAVILY_API_KEY`** environment variable is now **required** to use the enhanced web research functionality.
+    -   This key should be obtained from [Tavily AI](https://tavily.com/) and set in your environment (e.g., in a `.env` file).
+    -   The application loads this key via `settings.TAVILY_API_KEY`. Without it, Tavily searches will fail.
+-   **Updated Data Structures (`src/core/research_structures.py`):**
+    -   `SearchResult` has been renamed to `WebSearchResult` and its fields updated to better align with rich outputs from services like Tavily (e.g., `url`, `title`, `content_summary` from Tavily, `score` from Tavily, `raw_content_full` for optional full page fetch by our system).
+    -   A new `TavilySearchSessionReport` dataclass stores overall information from a Tavily search session (e.g., echoed query, overall answer if provided by Tavily).
+-   **Local Relevance Scoring (`RelevanceScorer`):**
+    -   The `RelevanceScorer` now processes `WebSearchResult` objects from Tavily.
+    -   It intelligently decides whether to use Tavily's provided `content_summary` or to fetch the full page content (using the retained `WebResearcher.fetch_and_parse_live_content()` method with `httpx` and `BeautifulSoup`) for its own LLM-based local relevance scoring.
+-   **Orchestration (`IntelligentResearchAssistant`):**
+    -   The main `research_for_task()` method now orchestrates the flow using Tavily search first, followed by local relevance scoring and knowledge synthesis.
+-   **Deprecated Google Search:**
+    -   The previous method `WebResearcher._search_google_scrape` (which constructed Google search URLs and scraped HTML) is now deprecated due to its unreliability and should not be used as a primary search mechanism.
+-   **Simulation Script:**
+    -   `run_planning_simulation.py` has been updated to use the Tavily-powered `WebResearcher` and requires `TAVILY_API_KEY` to be set for the research parts to function fully.
+
+This integration aims to provide significantly more powerful and reliable research capabilities to the system.
+
+## Further Enhancements to Python Code Generation (Update to Previous Code Generation Section)
+
+The Python code generation capabilities within `MultiLanguageCodeGenerator` have been further enhanced with a best practices integration and more detailed quality checks.
+
+### New: Best Practices Integration (`BestPracticesDatabase`):
+-   A `BestPracticesDatabase` component has been implemented.
+-   It loads Python-specific best practices from a JSON file: `config/python_best_practices.json`.
+    -   This JSON file is structured by categories (e.g., "general", "functions", "classes", "error_handling", "imports") and contains lists of best practice strings.
+    -   An initial set of common Python best practices has been included in this file.
+-   When generating Python code, `MultiLanguageCodeGenerator` now retrieves relevant practices from this database (based on default categories like "general", "functions", etc.) and includes them in the prompt to the LLM. This aims to guide the LLM towards generating code that adheres more closely to common Python conventions and good coding habits.
+
+### Enhanced Code Quality Checking (`CodeQualityChecker`):
+The `CodeQualityChecker` for Python has been made more robust with the following additional custom checks, leveraging more detailed AST analysis from `PythonAnalyzer`:
+-   **Naming Conventions:**
+    -   Basic check for `snake_case` for function names, method names (excluding dunders), and argument names (excluding `self`, `cls`).
+    -   Basic check for `PascalCase` for class names.
+-   **Function/Method Max Length:**
+    -   Checks if the body of a function or method exceeds a configurable maximum number of lines (default set in `CodeQualityChecker`, e.g., 50 lines). This uses line number information derived from AST node boundaries.
+-   **Wildcard Imports:**
+    -   Detects and flags `from module import *` statements.
+-   **Basic `try-except` Review:**
+    -   Identifies the use of generic `except:` or `except Exception:` clauses and suggests using more specific exception types. This relies on `PythonAnalyzer` identifying such clauses.
+-   **Existing Checks Retained:** Checks for "TODO"/"FIXME" comments, overly long lines, and basic docstring presence remain.
+-   **Quality Score:** The naive quality score calculation is adjusted based on the increased number of potential issues.
+
+### Updated `PythonAnalyzer`:
+-   To support the enhanced quality checks, `PythonAnalyzer.analyze_code_structure` now extracts more detailed information from the Python code's AST:
+    -   Approximate line counts for function and method bodies.
+    -   Line numbers where generic exception handlers (`except:`, `except Exception:`) are used.
+    -   Start and end line numbers for function and class definitions.
+
+These enhancements aim to improve the quality, readability, and maintainability of the Python code generated by the system. The simulation script (`run_planning_simulation.py`) logs the more detailed quality reports.

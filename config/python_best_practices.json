@@ -1,0 +1,28 @@
+{
+    "general": [
+        "Use clear and descriptive variable and function names.",
+        "Write comments for complex logic or non-obvious code sections.",
+        "Keep code DRY (Don't Repeat Yourself).",
+        "Follow PEP 8 style guidelines for code formatting."
+    ],
+    "functions": [
+        "Functions should ideally be short and focus on a single responsibility.",
+        "Include docstrings for all public functions, explaining purpose, arguments, and return values.",
+        "Use type hints for function arguments and return types.",
+        "Avoid using mutable default arguments."
+    ],
+    "classes": [
+        "Class names should use PascalCase.",
+        "Include docstrings for all public classes and methods.",
+        "Initialize instance variables in the __init__ method."
+    ],
+    "error_handling": [
+        "Handle exceptions gracefully using try-except blocks.",
+        "Use specific exception types rather than a bare 'except:'.",
+        "Clean up resources using 'finally' or context managers ('with' statement)."
+    ],
+    "imports": [
+        "Import modules at the top of the file.",
+        "Avoid wildcard imports (from module import *)."
+    ]
+}

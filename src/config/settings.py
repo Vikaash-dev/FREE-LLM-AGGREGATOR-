@@ -13,6 +13,7 @@ class Settings(BaseSettings):
     # General Application Settings
     LOG_LEVEL: str = "INFO"
     OPENHANDS_ENCRYPTION_KEY: Optional[str] = None
+    TAVILY_API_KEY: Optional[str] = None
 
     # LLM Aggregator Settings
     MAX_RETRIES: int = 3
