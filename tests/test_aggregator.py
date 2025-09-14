@@ -4,8 +4,8 @@ Tests for the LLM Aggregator core functionality.
 
 import pytest
 import asyncio
-from unittest.mock import AsyncMock, MagicMock, patch
-from datetime import datetime
+from unittest.mock import AsyncMock, MagicMock
+from datetime import datetime, UTC
 
 import sys
 from pathlib import Path
@@ -20,49 +20,56 @@ from src.models import (
     ModelInfo,
     ModelCapability,
     ProviderType,
-    ProviderStatus
+    ProviderStatus,
+    RateLimit
 )
 from src.core.aggregator import LLMAggregator
 from src.core.account_manager import AccountManager
 from src.core.router import ProviderRouter
 from src.core.rate_limiter import RateLimiter
-from src.providers.base import BaseProvider, ProviderError, RateLimitError
+from src.core.state_tracker import StateTracker
+from src.providers.base import BaseProvider, ProviderError
 
 
 class MockProvider(BaseProvider):
     """Mock provider for testing."""
-    
+
     def __init__(self, name: str, should_fail: bool = False):
-        self.name = name
-        self.should_fail = should_fail
-        self.is_available = True
-        self.credentials = []
-        
-        # Create mock config
-        self.config = ProviderConfig(
+        # 1. Create the config first
+        config = ProviderConfig(
             name=name,
             display_name=name.title(),
             provider_type=ProviderType.FREE,
             base_url=f"https://api.{name}.com",
-            priority=1,
-            status=ProviderStatus.ACTIVE,
             models=[
                 ModelInfo(
                     name=f"{name}-model-1",
                     display_name=f"{name.title()} Model 1",
+                    provider=name,
                     capabilities=[ModelCapability.TEXT_GENERATION],
                     context_length=4096,
                     is_free=True
                 )
-            ]
+            ],
+            rate_limit=RateLimit(),
+            priority=1,
+            status=ProviderStatus.ACTIVE
         )
-        
-        self.metrics = MagicMock()
-        self.metrics.dict.return_value = {
-            "total_requests": 10,
-            "successful_requests": 8,
-            "failed_requests": 2
-        }
+
+        # 2. Create mock credentials
+        credentials = [
+            AccountCredentials(
+                provider=name,
+                account_id="test-account",
+                api_key="test-key"
+            )
+        ]
+
+        # 3. Call super().__init__
+        super().__init__(config=config, credentials=credentials)
+
+        # 4. Set mock-specific attributes
+        self.should_fail = should_fail
     
     async def chat_completion(self, request: ChatCompletionRequest, credentials: AccountCredentials) -> ChatCompletionResponse:
         if self.should_fail:
@@ -71,7 +78,7 @@ class MockProvider(BaseProvider):
         return ChatCompletionResponse(
             id="test-id",
             object="chat.completion",
-            created=int(datetime.utcnow().timestamp()),
+            created=int(datetime.now(UTC).timestamp()),
             model=request.model,
             provider=self.name,
             choices=[{
@@ -97,12 +104,13 @@ class MockProvider(BaseProvider):
         yield ChatCompletionResponse(
             id="test-id",
             object="chat.completion.chunk",
-            created=int(datetime.utcnow().timestamp()),
+            created=int(datetime.now(UTC).timestamp()),
             model=request.model,
             provider=self.name,
             choices=[{
                 "index": 0,
                 "delta": {
+                    "role": "assistant",
                     "content": f"Mock stream from {self.name}"
                 },
                 "finish_reason": None
@@ -120,7 +128,7 @@ class MockProvider(BaseProvider):
 
 
 @pytest.fixture
-async def mock_account_manager():
+def mock_account_manager():
     """Create a mock account manager."""
     manager = AsyncMock(spec=AccountManager)
     
@@ -130,7 +138,7 @@ async def mock_account_manager():
         account_id="test-account",
         api_key="test-key",
         is_active=True,
-        created_at=datetime.utcnow()
+        created_at=datetime.now(UTC)
     )
     
     manager.get_credentials.return_value = credentials
@@ -141,7 +149,7 @@ async def mock_account_manager():
 
 
 @pytest.fixture
-async def mock_router():
+def mock_router():
     """Create a mock router."""
     router = AsyncMock(spec=ProviderRouter)
     router.get_provider_chain.return_value = ["provider1", "provider2"]
@@ -149,7 +157,7 @@ async def mock_router():
 
 
 @pytest.fixture
-async def mock_rate_limiter():
+def mock_rate_limiter():
     """Create a mock rate limiter."""
     limiter = AsyncMock(spec=RateLimiter)
     limiter.acquire.return_value = True
@@ -158,8 +166,17 @@ async def mock_rate_limiter():
 
 
 @pytest.fixture
-async def aggregator(mock_account_manager, mock_router, mock_rate_limiter):
+def mock_state_tracker():
+    """Create a mock state tracker."""
+    return AsyncMock(spec=StateTracker)
+
+
+@pytest.fixture
+def aggregator(mock_account_manager, mock_router, mock_rate_limiter, mock_state_tracker, monkeypatch):
     """Create an aggregator with mock dependencies."""
+
+    # Use an in-memory SQLite database for tests
+    monkeypatch.setattr("src.config.settings.DATABASE_URL", ":memory:")
     
     providers = [
         MockProvider("provider1"),
@@ -170,12 +187,12 @@ async def aggregator(mock_account_manager, mock_router, mock_rate_limiter):
         providers=providers,
         account_manager=mock_account_manager,
         router=mock_router,
-        rate_limiter=mock_rate_limiter
+        rate_limiter=mock_rate_limiter,
+        state_tracker=mock_state_tracker,
+        enable_auto_updater=False # Disable background task for tests
     )
     
-    yield aggregator
-    
-    await aggregator.close()
+    return aggregator
 
 
 @pytest.mark.asyncio
@@ -191,11 +208,11 @@ async def test_chat_completion_success(aggregator):
     
     assert response is not None
     assert response.provider == "provider1"
-    assert response.choices[0]["message"]["content"] == "Mock response from provider1"
+    assert response.choices[0].message.content == "Mock response from provider1"
 
 
 @pytest.mark.asyncio
-async def test_chat_completion_fallback(aggregator, mock_account_manager):
+async def test_chat_completion_fallback(aggregator):
     """Test fallback to second provider when first fails."""
     
     # Make first provider fail
@@ -210,7 +227,7 @@ async def test_chat_completion_fallback(aggregator, mock_account_manager):
     
     assert response is not None
     assert response.provider == "provider2"
-    assert response.choices[0]["message"]["content"] == "Mock response from provider2"
+    assert response.choices[0].message.content == "Mock response from provider2"
 
 
 @pytest.mark.asyncio
@@ -246,7 +263,7 @@ async def test_chat_completion_stream(aggregator):
     
     assert len(chunks) == 1
     assert chunks[0].provider == "provider1"
-    assert chunks[0].choices[0]["delta"]["content"] == "Mock stream from provider1"
+    assert chunks[0].choices[0].delta.content == "Mock stream from provider1"
 
 
 @pytest.mark.asyncio
@@ -258,9 +275,6 @@ async def test_specific_provider_request(aggregator):
         messages=[ChatMessage(role="user", content="Hello")],
         provider="provider2"
     )
-    
-    # Mock router to return only the specified provider
-    aggregator.router.get_provider_chain.return_value = ["provider2"]
     
     response = await aggregator.chat_completion(request)
     

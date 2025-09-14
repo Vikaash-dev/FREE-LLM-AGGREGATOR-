@@ -4,8 +4,8 @@ Account and credentials management system.
 
 import asyncio
 import structlog # Changed from logging
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional
+from datetime import datetime, timedelta, UTC
+from typing import Dict, List, Optional, Any
 from cryptography.fernet import Fernet
 import json
 import os
@@ -41,15 +41,15 @@ class AccountManager:
         
         # Initialize encryption
         if settings.OPENHANDS_ENCRYPTION_KEY:
-            self.cipher = Fernet(settings.OPENHANDS_ENCRYPTION_KEY.encode())
+            try:
+                key = settings.OPENHANDS_ENCRYPTION_KEY.encode()
+                self.cipher = Fernet(key)
+            except Exception as e:
+                logger.critical("Failed to create cipher from OPENHANDS_ENCRYPTION_KEY. The key may be invalid.", error=str(e))
+                raise ValueError("Invalid OPENHANDS_ENCRYPTION_KEY. Please provide a valid Fernet key.") from e
         else:
-            # Generate a new key if none provided
-            key = Fernet.generate_key()
-            self.cipher = Fernet(key)
-            logger.critical("OPENHANDS_ENCRYPTION_KEY not set, new key generated.",
-                            generated_key_part=key.decode()[:8] + "...", # Log a part of the key for identification if needed, carefully
-                            message="For persistent encrypted credentials, please set OPENHANDS_ENCRYPTION_KEY environment variable. "
-                                    "Without it, credentials in credentials.json may not be reloadable across sessions.")
+            logger.critical("OPENHANDS_ENCRYPTION_KEY is not set. Application cannot start without an encryption key.")
+            raise ValueError("OPENHANDS_ENCRYPTION_KEY is not set. Please provide a valid key in your environment.")
         
         # Load existing credentials
         asyncio.create_task(self.load_credentials())
@@ -84,7 +84,7 @@ class AccountManager:
             api_key=api_key,
             additional_headers=additional_headers or {},
             is_active=True,
-            created_at=datetime.utcnow()
+            created_at=datetime.now(UTC)
         )
         
         if provider not in self.credentials:
@@ -139,7 +139,7 @@ class AccountManager:
             self.usage_tracking[provider][account_id] += 1
         
         # Update last used timestamp
-        credentials.last_used = datetime.utcnow()
+        credentials.last_used = datetime.now(UTC)
         credentials.usage_count += 1
         
         await self.save_credentials()
@@ -170,8 +170,7 @@ class AccountManager:
                     found_to_mark = True
 
         if found_to_mark:
-        
-        await self.save_credentials()
+            await self.save_credentials()
     
     async def set_rate_limit_reset(self, provider: str, account_id: str, reset_time: datetime) -> None:
         """
@@ -209,7 +208,7 @@ class AccountManager:
         if not credentials.rate_limit_reset:
             return False
         
-        return datetime.utcnow() < credentials.rate_limit_reset
+        return datetime.now(UTC) < credentials.rate_limit_reset
     
     async def list_credentials(self) -> Dict[str, List[Dict[str, Any]]]: # Changed 'any' to 'Any'
         """
@@ -466,7 +465,7 @@ class AccountManager:
                     api_key=api_key,
                     additional_headers=additional_headers,
                     is_active=True, # Assume active if loaded from env
-                    created_at=datetime.utcnow(), # Set new creation time
+                    created_at=datetime.now(UTC), # Set new creation time
                     # last_used, usage_count, rate_limit_reset will be default/re-initialized
                 )
 

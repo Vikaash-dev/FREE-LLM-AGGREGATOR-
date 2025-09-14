@@ -11,7 +11,7 @@ Based on research from:
 import json
 from typing import Dict, List, Tuple, Optional, Any
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, UTC
 import re
 import asyncio
 from collections import defaultdict
@@ -49,6 +49,7 @@ except ImportError:
             return (sum((i - mean_val) ** 2 for i in x) / len(x)) ** 0.5
 
 from ..models import ChatCompletionRequest, ModelInfo, ModelCapability
+from .state_tracker import StateTracker # Added
 
 
 @dataclass
@@ -136,14 +137,20 @@ class ExternalMemorySystem:
     
     def __init__(self, db_path: str = "model_memory.db"):
         self.db_path = db_path
+        self.conn = sqlite3.connect(self.db_path)
         self.init_database()
         self.performance_cache = {}
         self.task_patterns = defaultdict(list)
+
+    def close(self):
+        """Close the database connection."""
+        if self.conn:
+            self.conn.close()
+            self.conn = None
     
     def init_database(self):
         """Initialize the SQLite database for persistent storage."""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        cursor = self.conn.cursor()
         
         # Model performance table
         cursor.execute("""
@@ -185,15 +192,13 @@ class ExternalMemorySystem:
             )
         """)
         
-        conn.commit()
-        conn.close()
+        self.conn.commit()
     
     def store_performance_data(self, model_name: str, provider: str, task_type: str, 
                              complexity_score: float, success_rate: float, 
                              response_time: float, user_satisfaction: float, task_hash: str):
         """Store performance data for a model on a specific task."""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        cursor = self.conn.cursor()
         
         cursor.execute("""
             INSERT INTO model_performance 
@@ -201,18 +206,16 @@ class ExternalMemorySystem:
              avg_response_time, user_satisfaction, timestamp, task_hash)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (model_name, provider, task_type, complexity_score, success_rate,
-              response_time, user_satisfaction, datetime.utcnow(), task_hash))
+              response_time, user_satisfaction, datetime.now(UTC), task_hash))
         
-        conn.commit()
-        conn.close()
+        self.conn.commit()
     
     def get_model_performance_history(self, model_name: str, task_type: str = None, 
                                     days: int = 30) -> List[Dict]:
         """Retrieve performance history for a model."""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        cursor = self.conn.cursor()
         
-        since_date = datetime.utcnow() - timedelta(days=days)
+        since_date = datetime.now(UTC) - timedelta(days=days)
         
         if task_type:
             cursor.execute("""
@@ -228,30 +231,26 @@ class ExternalMemorySystem:
             """, (model_name, since_date))
         
         results = cursor.fetchall()
-        conn.close()
         
         return [dict(zip([col[0] for col in cursor.description], row)) for row in results]
     
     def store_task_pattern(self, task_hash: str, task_type: str, complexity_features: Dict,
                           optimal_model: str, confidence_score: float):
         """Store a learned task pattern."""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        cursor = self.conn.cursor()
         
         cursor.execute("""
             INSERT INTO task_patterns 
             (task_hash, task_type, complexity_features, optimal_model, confidence_score, timestamp)
             VALUES (?, ?, ?, ?, ?, ?)
         """, (task_hash, task_type, json.dumps(complexity_features), optimal_model, 
-              confidence_score, datetime.utcnow()))
+              confidence_score, datetime.now(UTC)))
         
-        conn.commit()
-        conn.close()
+        self.conn.commit()
     
     def find_similar_tasks(self, task_hash: str, task_type: str, limit: int = 5) -> List[Dict]:
         """Find similar tasks from memory."""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        cursor = self.conn.cursor()
         
         cursor.execute("""
             SELECT * FROM task_patterns 
@@ -261,7 +260,6 @@ class ExternalMemorySystem:
         """, (task_type, limit))
         
         results = cursor.fetchall()
-        conn.close()
         
         return [dict(zip([col[0] for col in cursor.description], row)) for row in results]
 
@@ -445,12 +443,13 @@ class MetaModelController:
     Uses a small language model with external memory for decision making.
     """
     
-    def __init__(self, model_profiles: Dict[str, ModelCapabilityProfile], enable_ml_features: bool = None):
+    def __init__(self, model_profiles: Dict[str, ModelCapabilityProfile], state_tracker: StateTracker, enable_ml_features: bool = None):
         if enable_ml_features is None:
             enable_ml_features = TORCH_AVAILABLE
             
         self.ml_enabled = enable_ml_features and TORCH_AVAILABLE
         self.model_profiles = model_profiles
+        self.state_tracker = state_tracker # Added
         
         if self.ml_enabled:
             # Use DATABASE_URL from settings for ExternalMemorySystem
@@ -478,7 +477,7 @@ class MetaModelController:
         Select the optimal model for a given request.
         Returns (model_name, confidence_score).
         """
-        start_time = datetime.utcnow()
+        start_time = datetime.now(UTC)
         
         if not self.ml_enabled:
             logger.debug("ML features disabled, using fallback model selection.", request_id=request.id if hasattr(request, 'id') else 'N/A', user_id=user_id)
@@ -529,13 +528,34 @@ class MetaModelController:
         # Select best model
         if model_scores:
             best_model_name, best_score = max(model_scores.items(), key=lambda x: x[1])
+
+            # Log the selection decision
+            provider_name = self.model_profiles[best_model_name].provider
+            reason = f"Selected based on a composite score of compatibility, performance, preference, and cost-benefit."
+            context = {
+                "final_score": round(best_score, 4),
+                "confidence": round(best_score, 2),
+                "task_complexity": round(task_complexity.overall_complexity, 4),
+                "num_candidates": len(candidate_models),
+                "user_id": user_id,
+                "processing_time_ms": (datetime.now(UTC) - start_time).total_seconds() * 1000
+            }
+            # The plan_id and task_id are not available here, so we pass None.
+            self.state_tracker.log_provider_selection(
+                plan_id=None,
+                task_id=None,
+                provider_name=f"{provider_name}/{best_model_name}", # Log both provider and model
+                reason=reason,
+                other_context=context
+            )
+
             logger.info("Optimal model selected",
                         best_model=best_model_name,
                         confidence=round(best_score, 2),
                         task_complexity=task_complexity.overall_complexity,
                         num_candidates=len(candidate_models),
                         user_id=user_id,
-                        processing_time_ms=(datetime.utcnow() - start_time).total_seconds() * 1000)
+                        processing_time_ms=(datetime.now(UTC) - start_time).total_seconds() * 1000)
             return best_model_name, best_score
 
         # Fallback to cascade routing if no scores
@@ -630,7 +650,7 @@ class MetaModelController:
         
         for record in history:
             # Weight more recent records higher
-            age_days = (datetime.utcnow() - datetime.fromisoformat(record['timestamp'])).days
+            age_days = (datetime.now(UTC) - datetime.fromisoformat(record['timestamp'])).days
             weight = max(0.1, 1.0 - (age_days / 30))  # Decay over 30 days
             
             # Combine success rate and user satisfaction

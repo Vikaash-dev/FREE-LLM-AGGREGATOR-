@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 from src.core.reasoner import ContextualReasoningEngine
 from src.core.planning_structures import Task, ProjectContext, TaskStatus
-from src.models import ChatCompletionResponse, Choice, Message as OpenHandsMessage
+from src.models import ChatCompletionResponse, ChatCompletionChoice as Choice, ChatMessage as OpenHandsMessage
 
 
 class TestContextualReasoner(unittest.TestCase):
@@ -42,7 +42,7 @@ class TestContextualReasoner(unittest.TestCase):
         }
         '''
         mock_llm_choice = Choice(index=0, message=OpenHandsMessage(role="assistant", content=mock_reasoning_json), finish_reason="stop")
-        mock_llm_response = ChatCompletionResponse(id="sim_resp_r1", object="chat.completion", created=0, model="sim_model", choices=[mock_llm_choice])
+        mock_llm_response = ChatCompletionResponse(id="sim_resp_r1", object="chat.completion", created=0, model="sim_model", provider="mock", choices=[mock_llm_choice])
         self.mock_llm_aggregator.chat_completion = AsyncMock(return_value=mock_llm_response)
 
         reasoning_output = self._run_async(self.reasoner.reason_about_task(self.sample_task, analyzed_context_sample))

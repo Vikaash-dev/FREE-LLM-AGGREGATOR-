@@ -7,12 +7,13 @@ from src.core.state_tracker import StateTracker
 class TestStateTracker(unittest.TestCase):
 
     def setUp(self):
-        self.tracker = StateTracker()
         # Mock structlog logger used by StateTracker to check calls
         self.mock_logger = MagicMock()
         # We need to patch where structlog.get_logger is called from within state_tracker.py
         self.logger_patch = patch('src.core.state_tracker.logger', self.mock_logger)
         self.logger_patch.start()
+        # Instantiate the tracker *after* the patch is started
+        self.tracker = StateTracker()
 
     def tearDown(self):
         self.logger_patch.stop()
@@ -28,7 +29,7 @@ class TestStateTracker(unittest.TestCase):
         event = self.tracker.history[0]
         self.assertEqual(event["event_type"], "plan_started")
         self.assertEqual(event["plan_id"], "plan1")
-        self.assertEqual(event["details"]["user_instruction"], "Test instruction")
+        self.assertEqual(event["user_instruction"], "Test instruction")
         self.mock_logger.info.assert_called_with("plan_started", plan_id="plan1", task_id=None,
                                                  user_instruction="Test instruction", total_tasks_in_plan=3)
 
@@ -38,7 +39,7 @@ class TestStateTracker(unittest.TestCase):
         event = self.tracker.history[0]
         self.assertEqual(event["event_type"], "task_started")
         self.assertEqual(event["task_id"], "task1")
-        self.assertEqual(event["details"]["description"], "Do something")
+        self.assertEqual(event["description"], "Do something")
         self.mock_logger.info.assert_called_with("task_started", plan_id="plan1", task_id="task1",
                                                  description="Do something", dependencies=["depA"])
 
@@ -51,7 +52,7 @@ class TestStateTracker(unittest.TestCase):
 
         reasoning_event = self.tracker.history[0]
         self.assertEqual(reasoning_event["event_type"], "task_reasoning_updated")
-        self.assertEqual(reasoning_event["details"]["reasoning_decision"], decision)
+        self.assertEqual(reasoning_event["reasoning_decision"], decision)
         self.mock_logger.info.assert_any_call("task_reasoning_updated", plan_id="plan1", task_id="task1",
                                                 reasoning_decision=decision)
 
@@ -66,7 +67,7 @@ class TestStateTracker(unittest.TestCase):
         self.assertEqual(len(self.tracker.history), 1)
         event = self.tracker.history[0]
         self.assertEqual(event["event_type"], "task_completed")
-        self.assertEqual(event["details"]["final_status"], "COMPLETED")
+        self.assertEqual(event["final_status"], "COMPLETED")
         self.mock_logger.info.assert_called_with("task_completed", plan_id="plan1", task_id="task1",
                                                  final_status="COMPLETED", message="Finished fine.", output_summary="Output generated.")
 
@@ -75,7 +76,7 @@ class TestStateTracker(unittest.TestCase):
         self.assertEqual(len(self.tracker.history), 1)
         event = self.tracker.history[0]
         self.assertEqual(event["event_type"], "task_failed")
-        self.assertEqual(event["details"]["error_message"], "It broke")
+        self.assertEqual(event["error_message"], "It broke")
         self.mock_logger.warn.assert_called_with("task_failed", plan_id="plan1", task_id="task1",
                                                   error_message="It broke", error_type="SimError")
 

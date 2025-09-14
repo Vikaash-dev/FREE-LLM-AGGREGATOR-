@@ -8,8 +8,21 @@ import random
 import time
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, UTC
 import httpx # Added for specific exception handling
+from enum import Enum
+from dataclasses import dataclass, field
+
+class CircuitBreakerState(Enum):
+    CLOSED = "closed"
+    OPEN = "open"
+    HALF_OPEN = "half_open"
+
+@dataclass
+class CircuitBreaker:
+    state: CircuitBreakerState = CircuitBreakerState.CLOSED
+    failure_count: int = 0
+    opened_at: Optional[datetime] = None
 
 from ..models import (
     ChatCompletionRequest,
@@ -24,6 +37,7 @@ from ..providers.base import BaseProvider, ProviderError, RateLimitError, Authen
 from .account_manager import AccountManager
 from .router import ProviderRouter
 from .rate_limiter import RateLimiter
+from .state_tracker import StateTracker # Added
 from .meta_controller import MetaModelController, ModelCapabilityProfile # Removed TaskComplexityAnalyzer, not directly used here
 from .ensemble_system import EnsembleSystem
 from .auto_updater import AutoUpdater, integrate_auto_updater
@@ -50,6 +64,7 @@ class LLMAggregator:
         account_manager: AccountManager,
         router: ProviderRouter,
         rate_limiter: RateLimiter,
+        state_tracker: StateTracker, # Added
         max_retries: Optional[int] = None,
         retry_delay: Optional[float] = None,
         enable_meta_controller: bool = True,
@@ -65,6 +80,7 @@ class LLMAggregator:
             account_manager: Manages credentials for different providers.
             router: Determines the order/selection of providers for a request.
             rate_limiter: Handles rate limiting for API requests.
+            state_tracker: Logs events and state changes.
             max_retries: Maximum number of retries for a request to a provider.
                          Sources from settings if None.
             retry_delay: Initial delay in seconds between retries.
@@ -79,7 +95,8 @@ class LLMAggregator:
         self.providers: Dict[str, BaseProvider] = {provider.name: provider for provider in providers}
         self.account_manager: AccountManager = account_manager
         self.router: ProviderRouter = router
-        self.rate_limiter = rate_limiter
+        self.rate_limiter: RateLimiter = rate_limiter
+        self.state_tracker: StateTracker = state_tracker # Added
         
         # Enhanced features
         self.enable_meta_controller = enable_meta_controller
@@ -87,8 +104,7 @@ class LLMAggregator:
         self.enable_auto_updater = enable_auto_updater
         
         # Circuit Breaker Attributes
-        self.provider_failure_counts: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
-        self.provider_circuit_open_until: Dict[str, Dict[str, datetime]] = defaultdict(lambda: defaultdict(datetime))
+        self.circuits: Dict[Tuple[str, str], CircuitBreaker] = defaultdict(CircuitBreaker)
         self.CIRCUIT_BREAKER_THRESHOLD = 3  # Max failures before opening circuit
         self.CIRCUIT_BREAKER_COOLDOWN_SECONDS = 300  # 5 minutes cooldown
 
@@ -160,7 +176,7 @@ class LLMAggregator:
                 
                 model_profiles[model.name] = profile
         
-        return MetaModelController(model_profiles)
+        return MetaModelController(model_profiles, state_tracker=self.state_tracker)
     
     def _categorize_model_size(self, model: ModelInfo) -> str:
         """Categorize model size based on name and characteristics."""
@@ -341,6 +357,10 @@ class LLMAggregator:
         await self.rate_limiter.acquire(user_id)
         
         try:
+            # If a specific provider is requested, bypass intelligent routing
+            if request.provider:
+                return await self._chat_completion_traditional(request, user_id)
+
             # Use meta-controller for intelligent model selection if enabled
             if self.enable_meta_controller and self.meta_controller:
                 return await self._chat_completion_with_meta_controller(request, user_id)
@@ -693,142 +713,115 @@ class LLMAggregator:
             # Let's refine: check circuit AFTER model_name is resolved.
             pass # Will resolve model_name later
 
-        # If model_name is not "auto", check circuit now.
-        if model_name != "auto":
-            open_until = self.provider_circuit_open_until[provider_name].get(model_name)
-            if open_until and datetime.utcnow() < open_until:
-                logger.warning("Circuit open for model", provider_name=provider_name, model_name=model_name, open_until=open_until.isoformat())
-                return None # Circuit is open for this specific model
-
-        # Resolve actual model name if "auto"
-        if request.model == "auto": # Use request.model here, as model_name might have been changed above
-            resolved_model_name = await self._select_model(provider, request) # _select_model could log its choice/failure
-            if not resolved_model_name:
+        # Resolve model name if "auto" is specified
+        if request.model == "auto":
+            model_name = await self._select_model(provider, request)
+            if not model_name:
                 logger.warning("No suitable model found by _select_model", provider_name=provider_name, original_request_model=request.model)
-                # Consider this a failure for "auto" on this provider
-                self.provider_failure_counts[provider_name]["auto"] += 1 # Use "auto" as key
-                if self.provider_failure_counts[provider_name]["auto"] >= self.CIRCUIT_BREAKER_THRESHOLD:
-                    self.provider_circuit_open_until[provider_name]["auto"] = datetime.utcnow() + timedelta(seconds=self.CIRCUIT_BREAKER_COOLDOWN_SECONDS)
-                    self.provider_failure_counts[provider_name]["auto"] = 0
-                    logger.error("Circuit for 'auto' model selection opened", provider_name=provider_name, cooldown_seconds=self.CIRCUIT_BREAKER_COOLDOWN_SECONDS)
                 return None
-            model_name = resolved_model_name # This is the actual model_name to be used
             logger.info("Model 'auto' resolved", provider_name=provider_name, resolved_model_name=model_name)
+        else:
+            model_name = request.model
 
-            # Now check circuit for the resolved model_name
-            open_until = self.provider_circuit_open_until[provider_name].get(model_name)
-            if open_until and datetime.utcnow() < open_until:
-                logger.warning("Circuit open for resolved 'auto' model", provider_name=provider_name, model_name=model_name, open_until=open_until.isoformat())
+        # Check circuit breaker state
+        circuit = self.circuits[(provider_name, model_name)]
+        if circuit.state == CircuitBreakerState.OPEN:
+            if datetime.now(UTC) > circuit.opened_at + timedelta(seconds=self.CIRCUIT_BREAKER_COOLDOWN_SECONDS):
+                circuit.state = CircuitBreakerState.HALF_OPEN
+                logger.warning("Circuit breaker cooldown ended. State is now HALF_OPEN.", provider=provider_name, model=model_name)
+            else:
+                logger.warning("Circuit is OPEN. Skipping request.", provider=provider_name, model=model_name)
                 return None
-
 
         # Create request with resolved model
-        resolved_request = request.copy()
-        resolved_request.model = model_name # model_name is now the resolved one
+        resolved_request = request.model_copy()
+        resolved_request.model = model_name
+
+        # Log the attempt before the loop
+        self.state_tracker.log_chat_completion_attempt(
+            plan_id=None, task_id=None, provider=provider_name, model=model_name
+        )
         
+        start_time = time.time()
+        last_error = None
+
         # Attempt request with retries
         for attempt in range(self.max_retries):
             try:
-                # model_name here is the one used for the actual API call and for circuit breaker logic on failure/success
                 response = await provider.chat_completion(resolved_request, credentials)
                 
-                # Update credentials usage
+                # Success: log result, reset circuit breaker, update usage
+                latency = time.time() - start_time
+                self.state_tracker.log_chat_completion_result(
+                    plan_id=None, task_id=None, provider=provider_name, model=model_name,
+                    latency=latency, success=True, response_id=response.id
+                )
+                self._handle_circuit_breaker_success(provider_name, model_name)
                 await self.account_manager.update_usage(credentials)
-                
-                # Success: reset failure count for this provider/model
-                self.provider_failure_counts[provider_name][model_name] = 0
-                # Optionally log if circuit was closed:
-                if self.provider_circuit_open_until[provider_name].get(model_name) and \
-                   self.provider_circuit_open_until[provider_name][model_name] < datetime.utcnow(): # Check if it was open and now it's past cooldown
-                    logger.info("Circuit closed due to successful call", provider_name=provider_name, model_name=model_name)
-                
                 return response
 
-            # Specific httpx errors
-            except httpx.ReadTimeout as e:
-                logger.warning("ReadTimeout from provider", provider_name=provider_name, model_name=model_name, attempt=attempt + 1, max_retries=self.max_retries, error=str(e))
-                self.provider_failure_counts[provider_name][model_name] += 1
-                if self.provider_failure_counts[provider_name][model_name] >= self.CIRCUIT_BREAKER_THRESHOLD:
-                    self.provider_circuit_open_until[provider_name][model_name] = datetime.utcnow() + timedelta(seconds=self.CIRCUIT_BREAKER_COOLDOWN_SECONDS)
-                    self.provider_failure_counts[provider_name][model_name] = 0
-                    logger.error("Circuit opened due to ReadTimeouts", provider_name=provider_name, model_name=model_name, cooldown_seconds=self.CIRCUIT_BREAKER_COOLDOWN_SECONDS)
-                if attempt == self.max_retries - 1:
-                    raise ProviderError(f"ReadTimeout with {provider_name}/{model_name} after {self.max_retries} attempts: {e}") from e
-            except httpx.ConnectError as e:
-                logger.warning("ConnectError with provider", provider_name=provider_name, model_name=model_name, attempt=attempt + 1, max_retries=self.max_retries, error=str(e))
-                self.provider_failure_counts[provider_name][model_name] += 1
-                if self.provider_failure_counts[provider_name][model_name] >= self.CIRCUIT_BREAKER_THRESHOLD:
-                    self.provider_circuit_open_until[provider_name][model_name] = datetime.utcnow() + timedelta(seconds=self.CIRCUIT_BREAKER_COOLDOWN_SECONDS)
-                    self.provider_failure_counts[provider_name][model_name] = 0
-                    logger.error("Circuit opened due to ConnectErrors", provider_name=provider_name, model_name=model_name, cooldown_seconds=self.CIRCUIT_BREAKER_COOLDOWN_SECONDS)
-                if attempt == self.max_retries - 1:
-                    raise ProviderError(f"ConnectError with {provider_name}/{model_name} after {self.max_retries} attempts: {e}") from e
-            except httpx.HTTPStatusError as e:
-                logger.warning("HTTPStatusError from provider",
-                               provider_name=provider_name, model_name=model_name, attempt=attempt + 1, max_retries=self.max_retries,
-                               status_code=e.response.status_code, response_text=e.response.text[:200], error=str(e))
-                self.provider_failure_counts[provider_name][model_name] += 1
-                if self.provider_failure_counts[provider_name][model_name] >= self.CIRCUIT_BREAKER_THRESHOLD:
-                    self.provider_circuit_open_until[provider_name][model_name] = datetime.utcnow() + timedelta(seconds=self.CIRCUIT_BREAKER_COOLDOWN_SECONDS)
-                    self.provider_failure_counts[provider_name][model_name] = 0
-                    logger.error("Circuit opened due to HTTPStatusErrors", provider_name=provider_name, model_name=model_name, status_code=e.response.status_code, cooldown_seconds=self.CIRCUIT_BREAKER_COOLDOWN_SECONDS)
-                if attempt == self.max_retries - 1:
-                    raise ProviderError(f"HTTPStatusError {e.response.status_code} with {provider_name}/{model_name} after {self.max_retries} attempts: {e}") from e
-            except httpx.RequestError as e:
-                logger.warning("RequestError with provider", provider_name=provider_name, model_name=model_name, attempt=attempt + 1, max_retries=self.max_retries, error=str(e))
-                self.provider_failure_counts[provider_name][model_name] += 1
-                if self.provider_failure_counts[provider_name][model_name] >= self.CIRCUIT_BREAKER_THRESHOLD:
-                    self.provider_circuit_open_until[provider_name][model_name] = datetime.utcnow() + timedelta(seconds=self.CIRCUIT_BREAKER_COOLDOWN_SECONDS)
-                    self.provider_failure_counts[provider_name][model_name] = 0
-                    logger.error("Circuit opened due to RequestErrors", provider_name=provider_name, model_name=model_name, cooldown_seconds=self.CIRCUIT_BREAKER_COOLDOWN_SECONDS)
-                if attempt == self.max_retries - 1:
-                    raise ProviderError(f"RequestError with {provider_name}/{model_name} after {self.max_retries} attempts: {e}") from e
+            except (httpx.RequestError, ProviderError) as e:
+                last_error = e
+                # Handle failure and update circuit breaker
+                self._handle_circuit_breaker_failure(provider_name, model_name)
 
-            except RateLimitError:
-                logger.warning("RateLimitError from provider, not retrying or opening circuit", provider_name=provider_name, model_name=model_name)
-                raise
-            except AuthenticationError as e:
-                logger.error("AuthenticationError from provider, marking credentials invalid", provider_name=provider_name, model_name=model_name, error=str(e), account_id=credentials.account_id)
-                await self.account_manager.mark_credentials_invalid(provider_name, credentials.account_id)
-                raise
+                if isinstance(e, (RateLimitError, AuthenticationError)):
+                    logger.warning("Non-retriable error from provider.", provider=provider_name, model=model_name, error=str(e))
+                    raise  # Re-raise immediately, do not retry
 
-            except ProviderError as e: # General provider error from the provider's SDK
-                logger.warning("ProviderError from provider", provider_name=provider_name, model_name=model_name, attempt=attempt + 1, max_retries=self.max_retries, error=str(e), exc_info=True) # exc_info for better context
-                self.provider_failure_counts[provider_name][model_name] += 1
-                if self.provider_failure_counts[provider_name][model_name] >= self.CIRCUIT_BREAKER_THRESHOLD:
-                    self.provider_circuit_open_until[provider_name][model_name] = datetime.utcnow() + timedelta(seconds=self.CIRCUIT_BREAKER_COOLDOWN_SECONDS)
-                    self.provider_failure_counts[provider_name][model_name] = 0
-                    logger.error("Circuit opened due to ProviderErrors", provider_name=provider_name, model_name=model_name, cooldown_seconds=self.CIRCUIT_BREAKER_COOLDOWN_SECONDS)
-                if attempt == self.max_retries - 1:
-                    raise # Re-raise the original ProviderError
-            except asyncio.TimeoutError as e:
-                logger.warning("Asyncio TimeoutError", provider_name=provider_name, model_name=model_name, attempt=attempt + 1, max_retries=self.max_retries, error=str(e))
-                self.provider_failure_counts[provider_name][model_name] += 1
-                if self.provider_failure_counts[provider_name][model_name] >= self.CIRCUIT_BREAKER_THRESHOLD:
-                    self.provider_circuit_open_until[provider_name][model_name] = datetime.utcnow() + timedelta(seconds=self.CIRCUIT_BREAKER_COOLDOWN_SECONDS)
-                    self.provider_failure_counts[provider_name][model_name] = 0
-                    logger.error("Circuit opened due to asyncio.TimeoutError", provider_name=provider_name, model_name=model_name, cooldown_seconds=self.CIRCUIT_BREAKER_COOLDOWN_SECONDS)
-                if attempt == self.max_retries - 1:
-                     raise ProviderError(f"Asyncio TimeoutError with {provider_name}/{model_name} after {self.max_retries} attempts: {e}") from e
-            except Exception as e: # Catch-all for other unexpected errors
-                logger.error("Unexpected error during provider call",
-                               provider_name=provider_name, model_name=model_name, attempt=attempt + 1, max_retries=self.max_retries,
-                               error=str(e), exc_info=True)
-                self.provider_failure_counts[provider_name][model_name] += 1
-                if self.provider_failure_counts[provider_name][model_name] >= self.CIRCUIT_BREAKER_THRESHOLD:
-                    self.provider_circuit_open_until[provider_name][model_name] = datetime.utcnow() + timedelta(seconds=self.CIRCUIT_BREAKER_COOLDOWN_SECONDS)
-                    self.provider_failure_counts[provider_name][model_name] = 0
-                    logger.error("Circuit opened due to unexpected error", provider_name=provider_name, model_name=model_name, cooldown_seconds=self.CIRCUIT_BREAKER_COOLDOWN_SECONDS)
-                if attempt == self.max_retries - 1: # If it's the last attempt, raise it as a ProviderError
-                    raise ProviderError(f"Unexpected error with {provider_name}/{model_name} after {self.max_retries} attempts: {e}") from e
+                logger.warning("Retriable error from provider.",
+                               provider=provider_name, model=model_name, attempt=attempt + 1,
+                               max_retries=self.max_retries, error=str(e))
 
-            # If an error occurred and it's not the last attempt, sleep and retry
-            if attempt < self.max_retries - 1:
-                delay = self.retry_delay * (2 ** attempt)
-                logger.info("Retrying provider call after error", provider_name=provider_name, model_name=model_name, attempt=attempt + 2, max_retries=self.max_retries, delay_seconds=round(delay,2))
+                if attempt == self.max_retries - 1:
+                    logger.error("All retry attempts failed.", provider=provider_name, model=model_name)
+                    # Log final failure before raising
+                    latency = time.time() - start_time
+                    self.state_tracker.log_chat_completion_result(
+                        plan_id=None, task_id=None, provider=provider_name, model=model_name,
+                        latency=latency, success=False, error_message=str(last_error)
+                    )
+                    raise ProviderError(f"All retries failed for {provider_name}/{model_name}. Last error: {e}") from e
+
+                # Exponential backoff with jitter
+                delay = self.retry_delay * (2 ** attempt) + random.uniform(0, 1)
+                logger.info(f"Retrying in {delay:.2f} seconds...")
                 await asyncio.sleep(delay)
+            except Exception as e:
+                last_error = e
+                self._handle_circuit_breaker_failure(provider_name, model_name)
+                logger.error("Unexpected error during provider call.",
+                               provider=provider_name, model=model_name, error=str(e), exc_info=True)
+                # Log final failure before raising
+                latency = time.time() - start_time
+                self.state_tracker.log_chat_completion_result(
+                    plan_id=None, task_id=None, provider=provider_name, model=model_name,
+                    latency=latency, success=False, error_message=str(last_error)
+                )
+                raise ProviderError(f"Unexpected error with {provider_name}/{model_name}: {e}") from e
         
         return None # Should be unreachable if max_retries > 0, as errors are raised or re-raised.
+
+    def _handle_circuit_breaker_success(self, provider_name: str, model_name: str):
+        """Handle a successful call for the circuit breaker."""
+        circuit = self.circuits[(provider_name, model_name)]
+        if circuit.state == CircuitBreakerState.HALF_OPEN:
+            logger.warning("Circuit breaker is now CLOSED.", provider=provider_name, model=model_name)
+        circuit.state = CircuitBreakerState.CLOSED
+        circuit.failure_count = 0
+        circuit.opened_at = None
+
+    def _handle_circuit_breaker_failure(self, provider_name: str, model_name: str):
+        """Handle a failed call for the circuit breaker."""
+        circuit = self.circuits[(provider_name, model_name)]
+        circuit.failure_count += 1
+        if circuit.state == CircuitBreakerState.HALF_OPEN or circuit.failure_count >= self.CIRCUIT_BREAKER_THRESHOLD:
+            circuit.state = CircuitBreakerState.OPEN
+            circuit.opened_at = datetime.now(UTC)
+            logger.error("Circuit breaker is now OPEN.",
+                         provider=provider_name,
+                         model=model_name,
+                         cooldown_seconds=self.CIRCUIT_BREAKER_COOLDOWN_SECONDS)
     
     async def _try_provider_stream(
         self,
@@ -849,34 +842,27 @@ class LLMAggregator:
             return
 
         # Resolve model name if "auto" is specified
-        model_name = request.model # Initial model name for circuit key if not "auto"
-        if model_name == "auto":
-            # Check circuit for "auto" before resolving
-            open_until_auto = self.provider_circuit_open_until[provider_name].get("auto")
-            if open_until_auto and datetime.utcnow() < open_until_auto:
-                logger.warning("Circuit for 'auto' model selection is open for streaming", provider_name=provider_name, open_until=open_until_auto.isoformat())
-                return
-
-            resolved_model_name = await self._select_model(provider, request)
-            if not resolved_model_name:
+        if request.model == "auto":
+            model_name = await self._select_model(provider, request)
+            if not model_name:
                 logger.warning("No suitable model found by _select_model for streaming", provider_name=provider_name, original_request_model=request.model)
-                self.provider_failure_counts[provider_name]["auto"] += 1
-                if self.provider_failure_counts[provider_name]["auto"] >= self.CIRCUIT_BREAKER_THRESHOLD:
-                    self.provider_circuit_open_until[provider_name]["auto"] = datetime.utcnow() + timedelta(seconds=self.CIRCUIT_BREAKER_COOLDOWN_SECONDS)
-                    self.provider_failure_counts[provider_name]["auto"] = 0
-                    logger.error("Circuit for 'auto' model selection opened for streaming", provider_name=provider_name, cooldown_seconds=self.CIRCUIT_BREAKER_COOLDOWN_SECONDS)
                 return
-            model_name = resolved_model_name # Actual model name to be used
             logger.info("Model 'auto' resolved for streaming", provider_name=provider_name, resolved_model_name=model_name)
+        else:
+            model_name = request.model
         
-        # Check circuit for the specific model_name (either provided or resolved from "auto")
-        open_until = self.provider_circuit_open_until[provider_name].get(model_name)
-        if open_until and datetime.utcnow() < open_until:
-            logger.warning("Circuit open for model for streaming", provider_name=provider_name, model_name=model_name, open_until=open_until.isoformat())
-            return
+        # Check circuit breaker state
+        circuit = self.circuits[(provider_name, model_name)]
+        if circuit.state == CircuitBreakerState.OPEN:
+            if datetime.now(UTC) > circuit.opened_at + timedelta(seconds=self.CIRCUIT_BREAKER_COOLDOWN_SECONDS):
+                circuit.state = CircuitBreakerState.HALF_OPEN
+                logger.warning("Circuit breaker cooldown ended. State is now HALF_OPEN.", provider=provider_name, model=model_name)
+            else:
+                logger.warning("Circuit is OPEN. Skipping stream request.", provider=provider_name, model=model_name)
+                return
 
         # Create request with resolved model
-        resolved_request = request.copy()
+        resolved_request = request.model_copy()
         resolved_request.model = model_name
         
         # Stream response
@@ -884,80 +870,18 @@ class LLMAggregator:
             async for chunk in provider.chat_completion_stream(resolved_request, credentials):
                 yield chunk
 
-            # Success: Update credentials usage and reset failure count
+            # Success: Update credentials usage and reset circuit breaker
+            self._handle_circuit_breaker_success(provider_name, model_name)
             await self.account_manager.update_usage(credentials)
-            self.provider_failure_counts[provider_name][model_name] = 0
-            if self.provider_circuit_open_until[provider_name].get(model_name) and \
-               self.provider_circuit_open_until[provider_name][model_name] < datetime.utcnow():
-                logger.info("Circuit closed due to successful stream", provider_name=provider_name, model_name=model_name)
 
-        except httpx.ReadTimeout as e:
-            logger.warning("ReadTimeout during stream", provider_name=provider_name, model_name=model_name, error=str(e))
-            self.provider_failure_counts[provider_name][model_name] += 1
-            if self.provider_failure_counts[provider_name][model_name] >= self.CIRCUIT_BREAKER_THRESHOLD:
-                self.provider_circuit_open_until[provider_name][model_name] = datetime.utcnow() + timedelta(seconds=self.CIRCUIT_BREAKER_COOLDOWN_SECONDS)
-                self.provider_failure_counts[provider_name][model_name] = 0
-                logger.error("Circuit opened for stream due to ReadTimeouts", provider_name=provider_name, model_name=model_name, cooldown_seconds=self.CIRCUIT_BREAKER_COOLDOWN_SECONDS)
-            raise ProviderError(f"ReadTimeout during stream with {provider_name}/{model_name}: {e}") from e
-        except httpx.ConnectError as e:
-            logger.warning("ConnectError during stream", provider_name=provider_name, model_name=model_name, error=str(e))
-            self.provider_failure_counts[provider_name][model_name] += 1
-            if self.provider_failure_counts[provider_name][model_name] >= self.CIRCUIT_BREAKER_THRESHOLD:
-                self.provider_circuit_open_until[provider_name][model_name] = datetime.utcnow() + timedelta(seconds=self.CIRCUIT_BREAKER_COOLDOWN_SECONDS)
-                self.provider_failure_counts[provider_name][model_name] = 0
-                logger.error("Circuit opened for stream due to ConnectErrors", provider_name=provider_name, model_name=model_name, cooldown_seconds=self.CIRCUIT_BREAKER_COOLDOWN_SECONDS)
-            raise ProviderError(f"ConnectError during stream with {provider_name}/{model_name}: {e}") from e
-        except httpx.HTTPStatusError as e:
-            logger.warning("HTTPStatusError during stream",
-                           provider_name=provider_name, model_name=model_name, status_code=e.response.status_code,
-                           response_text=e.response.text[:200], error=str(e))
-            self.provider_failure_counts[provider_name][model_name] += 1
-            if self.provider_failure_counts[provider_name][model_name] >= self.CIRCUIT_BREAKER_THRESHOLD:
-                self.provider_circuit_open_until[provider_name][model_name] = datetime.utcnow() + timedelta(seconds=self.CIRCUIT_BREAKER_COOLDOWN_SECONDS)
-                self.provider_failure_counts[provider_name][model_name] = 0
-                logger.error("Circuit opened for stream due to HTTPStatusErrors", provider_name=provider_name, model_name=model_name, status_code=e.response.status_code, cooldown_seconds=self.CIRCUIT_BREAKER_COOLDOWN_SECONDS)
-            raise ProviderError(f"HTTPStatusError {e.response.status_code} during stream with {provider_name}/{model_name}: {e}") from e
-        except httpx.RequestError as e:
-            logger.warning("RequestError during stream", provider_name=provider_name, model_name=model_name, error=str(e))
-            self.provider_failure_counts[provider_name][model_name] += 1
-            if self.provider_failure_counts[provider_name][model_name] >= self.CIRCUIT_BREAKER_THRESHOLD:
-                self.provider_circuit_open_until[provider_name][model_name] = datetime.utcnow() + timedelta(seconds=self.CIRCUIT_BREAKER_COOLDOWN_SECONDS)
-                self.provider_failure_counts[provider_name][model_name] = 0
-                logger.error("Circuit opened for stream due to RequestErrors", provider_name=provider_name, model_name=model_name, cooldown_seconds=self.CIRCUIT_BREAKER_COOLDOWN_SECONDS)
-            raise ProviderError(f"RequestError during stream with {provider_name}/{model_name}: {e}") from e
-
-        except RateLimitError as e:
-            logger.warning("RateLimitError during stream, not opening circuit", provider_name=provider_name, model_name=model_name, error=str(e))
-            raise
-        except AuthenticationError as e:
-            logger.error("AuthenticationError during stream, marking credentials invalid", provider_name=provider_name, model_name=model_name, error=str(e), account_id=credentials.account_id)
-            await self.account_manager.mark_credentials_invalid(provider_name, credentials.account_id)
-            raise
-        except ProviderError as e:
-            logger.warning("ProviderError during stream", provider_name=provider_name, model_name=model_name, error=str(e), exc_info=True)
-            self.provider_failure_counts[provider_name][model_name] += 1
-            if self.provider_failure_counts[provider_name][model_name] >= self.CIRCUIT_BREAKER_THRESHOLD:
-                self.provider_circuit_open_until[provider_name][model_name] = datetime.utcnow() + timedelta(seconds=self.CIRCUIT_BREAKER_COOLDOWN_SECONDS)
-                self.provider_failure_counts[provider_name][model_name] = 0
-                logger.error("Circuit opened for stream due to ProviderErrors", provider_name=provider_name, model_name=model_name, cooldown_seconds=self.CIRCUIT_BREAKER_COOLDOWN_SECONDS)
-            raise
-        except asyncio.TimeoutError as e:
-            logger.warning("Asyncio TimeoutError during stream", provider_name=provider_name, model_name=model_name, error=str(e))
-            self.provider_failure_counts[provider_name][model_name] += 1
-            if self.provider_failure_counts[provider_name][model_name] >= self.CIRCUIT_BREAKER_THRESHOLD:
-                self.provider_circuit_open_until[provider_name][model_name] = datetime.utcnow() + timedelta(seconds=self.CIRCUIT_BREAKER_COOLDOWN_SECONDS)
-                self.provider_failure_counts[provider_name][model_name] = 0
-                logger.error("Circuit opened for stream due to asyncio.TimeoutError", provider_name=provider_name, model_name=model_name, cooldown_seconds=self.CIRCUIT_BREAKER_COOLDOWN_SECONDS)
-            raise ProviderError(f"Asyncio TimeoutError during stream with {provider_name}/{model_name}: {e}") from e
-        except Exception as e: # Catch-all for other unexpected errors
-            logger.error("Unexpected error during stream",
-                           provider_name=provider_name, model_name=model_name, error=str(e), exc_info=True)
-            self.provider_failure_counts[provider_name][model_name] += 1
-            if self.provider_failure_counts[provider_name][model_name] >= self.CIRCUIT_BREAKER_THRESHOLD:
-                self.provider_circuit_open_until[provider_name][model_name] = datetime.utcnow() + timedelta(seconds=self.CIRCUIT_BREAKER_COOLDOWN_SECONDS)
-                self.provider_failure_counts[provider_name][model_name] = 0
-                logger.error("Circuit opened for stream due to unexpected error", provider_name=provider_name, model_name=model_name, cooldown_seconds=self.CIRCUIT_BREAKER_COOLDOWN_SECONDS)
-            raise ProviderError(f"Unexpected error during stream with {provider_name} for model {model_name}: {e}") from e
+        except (httpx.RequestError, ProviderError) as e:
+            self._handle_circuit_breaker_failure(provider_name, model_name)
+            logger.warning("Provider error during stream", provider=provider_name, model=model_name, error=str(e))
+            raise ProviderError(f"Error during stream with {provider_name}/{model_name}: {e}") from e
+        except Exception as e:
+            self._handle_circuit_breaker_failure(provider_name, model_name)
+            logger.error("Unexpected error during stream", provider=provider_name, model=model_name, error=str(e), exc_info=True)
+            raise ProviderError(f"Unexpected error during stream with {provider_name}/{model_name}: {e}") from e
     
     async def _select_model(
         self,
@@ -1050,7 +974,7 @@ class LLMAggregator:
             status[provider_name] = {
                 "available": provider.is_available,
                 "status": provider.config.status.value,
-                "metrics": provider.metrics.dict(),
+                "metrics": provider.metrics.model_dump(),
                 "models_count": len(provider.config.models),
                 "credentials_count": len(provider.credentials)
             }
@@ -1191,7 +1115,7 @@ class LLMAggregator:
             'overall_complexity': complexity.overall_complexity
         }
     
-    async def get_model_recommendations(self, request: ChatCompletionRequest) -> Dict[str, Any]]:
+    async def get_model_recommendations(self, request: ChatCompletionRequest) -> Dict[str, Any]:
         """
         Provides model recommendations for a given request.
 
@@ -1251,7 +1175,7 @@ class LLMAggregator:
         except Exception as e:
             logger.error("Error starting auto-updater", error=str(e), exc_info=True)
     
-    async def force_update_providers(self) -> Dict[str, Any]]:
+    async def force_update_providers(self) -> Dict[str, Any]:
         """
         Forces an immediate update of all provider information via the auto-updater.
 
@@ -1290,7 +1214,7 @@ class LLMAggregator:
             logger.error("Error forcing provider updates", error=str(e), exc_info=True)
             return {"error": str(e)}
     
-    async def get_auto_update_status(self) -> Dict[str, Any]]:
+    async def get_auto_update_status(self) -> Dict[str, Any]:
         """
         Retrieves the current status of the auto-updater.
 
@@ -1313,7 +1237,7 @@ class LLMAggregator:
             logger.error("Error getting auto-update status", error=str(e), exc_info=True)
             return {"enabled": True, "error": str(e)}
     
-    async def configure_auto_updater(self, config: Dict[str, Any]) -> Dict[str, Any]]:
+    async def configure_auto_updater(self, config: Dict[str, Any]) -> Dict[str, Any]:
         """
         Configures settings for the auto-updater.
 
@@ -1360,7 +1284,7 @@ class LLMAggregator:
             logger.error("Error configuring auto-updater", config_options=config, error=str(e), exc_info=True)
             return {"error": str(e)}
     
-    async def get_provider_updates_history(self, provider_name: Optional[str] = None) -> Dict[str, Any]]:
+    async def get_provider_updates_history(self, provider_name: Optional[str] = None) -> Dict[str, Any]:
         """
         Retrieves the history of provider updates from the auto-updater.
 
@@ -1427,5 +1351,9 @@ class LLMAggregator:
         # Close auto-updater
         if self.auto_updater:
             await self.auto_updater.close() # This method should also use structlog
+
+        # Close memory system
+        if self.meta_controller and self.meta_controller.memory_system:
+            self.meta_controller.memory_system.close()
         
         logger.info("LLM Aggregator closed successfully.")

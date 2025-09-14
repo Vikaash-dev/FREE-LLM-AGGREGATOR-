@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock, MagicMock # For mocking LLMAggregator
 
 from src.core.planner import DevikaInspiredPlanner
 from src.core.planning_structures import ProjectContext, ExecutionPlan, TaskStatus
-from src.models import ChatCompletionResponse, Choice, Message as OpenHandsMessage # Renamed to avoid conflict with unittest.Message
+from src.models import ChatCompletionResponse, ChatCompletionChoice as Choice, ChatMessage as OpenHandsMessage # Renamed to avoid conflict with unittest.Message
 
 class TestDevikaInspiredPlanner(unittest.TestCase):
 
@@ -31,7 +31,7 @@ class TestDevikaInspiredPlanner(unittest.TestCase):
         }
         '''
         mock_llm_choice = Choice(index=0, message=OpenHandsMessage(role="assistant", content=mock_response_content), finish_reason="stop")
-        mock_llm_response = ChatCompletionResponse(id="sim_resp_1", object="chat.completion", created=0, model="sim_model", choices=[mock_llm_choice])
+        mock_llm_response = ChatCompletionResponse(id="sim_resp_1", object="chat.completion", created=0, model="sim_model", provider="mock", choices=[mock_llm_choice])
         self.mock_llm_aggregator.chat_completion = AsyncMock(return_value=mock_llm_response)
 
         result = self._run_async(self.planner.parse_user_intent(instruction, self.project_context))
@@ -63,7 +63,7 @@ class TestDevikaInspiredPlanner(unittest.TestCase):
         ]
         '''
         mock_llm_choice = Choice(index=0, message=OpenHandsMessage(role="assistant", content=mock_task_list_json), finish_reason="stop")
-        mock_llm_response = ChatCompletionResponse(id="sim_resp_2", object="chat.completion", created=0, model="sim_model", choices=[mock_llm_choice])
+        mock_llm_response = ChatCompletionResponse(id="sim_resp_2", object="chat.completion", created=0, model="sim_model", provider="mock", choices=[mock_llm_choice])
         self.mock_llm_aggregator.chat_completion = AsyncMock(return_value=mock_llm_response)
 
         execution_plan = self._run_async(self.planner.decompose_complex_task(parsed_intent, self.project_context))
@@ -77,7 +77,7 @@ class TestDevikaInspiredPlanner(unittest.TestCase):
     def test_decompose_complex_task_llm_json_error(self):
         parsed_intent = {"goal": "Goal for bad JSON", "raw_instruction": "Goal for bad JSON"}
         self.mock_llm_aggregator.chat_completion = AsyncMock(
-            return_value=ChatCompletionResponse(id="sim_resp_3", object="chat.completion", created=0, model="sim_model",
+            return_value=ChatCompletionResponse(id="sim_resp_3", object="chat.completion", created=0, model="sim_model", provider="mock",
                                              choices=[Choice(index=0, message=OpenHandsMessage(role="assistant", content="This is not JSON"), finish_reason="stop")])
         )
         execution_plan = self._run_async(self.planner.decompose_complex_task(parsed_intent, self.project_context))

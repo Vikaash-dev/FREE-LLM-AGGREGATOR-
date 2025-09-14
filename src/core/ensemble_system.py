@@ -95,7 +95,7 @@ class ResponseQualityEvaluator:
                          original_request: ChatCompletionRequest) -> Dict[str, float]:
         """Evaluate a response across multiple quality dimensions."""
         
-        if not response.choices or not response.choices[0].get('message', {}).get('content'):
+        if not response.choices or not response.choices[0].message or not response.choices[0].message.content:
             return {
                 'coherence_score': 0.0,
                 'relevance_score': 0.0,
@@ -391,8 +391,8 @@ class ResponseFuser:
         # Extract content from all responses
         contents = []
         for candidate in candidates:
-            if candidate.response.choices and candidate.response.choices[0].get('message', {}).get('content'):
-                contents.append(candidate.response.choices[0]['message']['content'])
+            if candidate.response.choices and candidate.response.choices[0].message and candidate.response.choices[0].message.content:
+                contents.append(candidate.response.choices[0].message.content)
         
         if not contents:
             return candidates[0].response
@@ -449,8 +449,8 @@ class ResponseFuser:
         # Extract sentences from all responses
         all_sentences = []
         for candidate in candidates:
-            if candidate.response.choices and candidate.response.choices[0].get('message', {}).get('content'):
-                content = candidate.response.choices[0]['message']['content']
+            if candidate.response.choices and candidate.response.choices[0].message and candidate.response.choices[0].message.content:
+                content = candidate.response.choices[0].message.content
                 sentences = [s.strip() for s in content.split('.') if s.strip()]
                 
                 for sentence in sentences:
@@ -539,7 +539,7 @@ class EnsembleSystem:
         # Configuration
         self.max_candidates = 3
         self.quality_threshold = 0.6
-        self.fusion_strategy = 'weighted_fusion'
+        self.fusion_strategy = 'best_response'
     
     async def generate_ensemble_response(self, request: ChatCompletionRequest,
                                        model_responses: Dict[str, ChatCompletionResponse],
@@ -599,20 +599,18 @@ class EnsembleSystem:
         if hasattr(fused_response, 'usage') and fused_response.usage:
             # Aggregate usage from all candidates
             total_prompt_tokens = sum(
-                c.response.usage.get('prompt_tokens', 0) for c in top_candidates
-                if c.response.usage
+                c.response.usage.prompt_tokens for c in top_candidates if c.response.usage
             )
             total_completion_tokens = sum(
-                c.response.usage.get('completion_tokens', 0) for c in top_candidates
-                if c.response.usage
+                c.response.usage.completion_tokens for c in top_candidates if c.response.usage
             )
             
-            fused_response.usage.update({
-                'prompt_tokens': total_prompt_tokens,
-                'completion_tokens': total_completion_tokens,
-                'total_tokens': total_prompt_tokens + total_completion_tokens,
-                'ensemble_models': len(top_candidates)
-            })
+            fused_response.usage.prompt_tokens = total_prompt_tokens
+            fused_response.usage.completion_tokens = total_completion_tokens
+            fused_response.usage.total_tokens = total_prompt_tokens + total_completion_tokens
+            # Add a new field to indicate ensemble usage. This is a bit of a hack.
+            # A better solution would be to add `ensemble_models` to the ChatCompletionUsage model.
+            fused_response.usage.ensemble_models = len(top_candidates)
         
         return fused_response
     
@@ -701,7 +699,9 @@ class EnsembleSystem:
         
         # Add ensemble metadata
         if best_response and hasattr(best_response, 'usage') and best_response.usage:
-            best_response.usage['ensemble_mode'] = 'fallback'
-            best_response.usage['ensemble_models'] = len(model_responses)
+            # Pydantic models don't support item assignment.
+            # We can add a new attribute if the model is configured to allow it.
+            # For now, we just return the best response without modifying it.
+            pass
         
         return best_response or list(model_responses.values())[0]

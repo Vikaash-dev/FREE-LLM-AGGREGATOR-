@@ -4,7 +4,7 @@ import json # For parsing LLM responses
 
 from .planning_structures import Task, ProjectContext # Core data structures
 from .aggregator import LLMAggregator # For potential LLM calls in future reasoning steps
-from ..models import ChatCompletionRequest, Message # For LLMAggregator
+from ..models import ChatCompletionRequest, ChatMessage as Message # For LLMAggregator
 
 
 logger = structlog.get_logger(__name__)

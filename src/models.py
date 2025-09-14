@@ -126,6 +126,7 @@ class ChatCompletionUsage(BaseModel):
     prompt_tokens: int
     completion_tokens: int
     total_tokens: int
+    ensemble_models: Optional[int] = None
 
 
 class ChatCompletionResponse(BaseModel):

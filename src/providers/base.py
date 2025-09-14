@@ -237,7 +237,7 @@ class OpenAICompatibleProvider(BaseProvider):
         # Prepare request data
         data = {
             "model": request.model,
-            "messages": [msg.dict() for msg in request.messages],
+            "messages": [msg.model_dump() for msg in request.messages],
             "stream": False
         }
         
@@ -274,7 +274,7 @@ class OpenAICompatibleProvider(BaseProvider):
         # Prepare request data
         data = {
             "model": request.model,
-            "messages": [msg.dict() for msg in request.messages],
+            "messages": [msg.model_dump() for msg in request.messages],
             "stream": True
         }
         

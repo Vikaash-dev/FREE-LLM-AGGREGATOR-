@@ -13,11 +13,12 @@ import os
 from contextlib import asynccontextmanager
 from typing import Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException, Depends, Request, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Depends, Request, BackgroundTasks, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import uvicorn
+from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 
 from src.config import settings # Centralized settings
 # Ensure setup_logging is called before any loggers are instantiated by other modules if they also use structlog.
@@ -33,6 +34,7 @@ from ..models import (
 from ..core.aggregator import LLMAggregator
 from ..core.account_manager import AccountManager
 from ..core.router import ProviderRouter
+from ..core.state_tracker import StateTracker
 from ..core.rate_limiter import RateLimiter, RateLimitExceeded
 from ..providers.openrouter import create_openrouter_provider
 from ..providers.groq import create_groq_provider
@@ -58,12 +60,27 @@ async def lifespan(app: FastAPI):
     global aggregator
     
     # Startup
-    logger.info("Starting LLM API Aggregator server...") # Changed message slightly for clarity
+    logger.info("Starting LLM API Aggregator server...", app_env=settings.APP_ENV)
+
+    # Security checks for production environment
+    if settings.APP_ENV == "production":
+        logger.info("Production environment detected. Applying security checks.")
+
+        # 1. Ensure ADMIN_TOKEN is set
+        if not settings.ADMIN_TOKEN:
+            logger.critical("FATAL: ADMIN_TOKEN is not set in production environment. Application will not start.")
+            raise ValueError("ADMIN_TOKEN is not set. This is required for production environments.")
+
+        # 2. Ensure CORS is not wide open
+        if "*" in settings.ALLOWED_ORIGINS:
+            logger.critical("FATAL: Insecure CORS policy `allow_origins=['*']` is not permitted in production environment. Application will not start.")
+            raise ValueError("Insecure CORS policy. Using '*' for ALLOWED_ORIGINS is not allowed in production.")
     
     # Initialize components
     # AccountManager will now use OPENHANDS_ENCRYPTION_KEY from settings
     account_manager = AccountManager()
     rate_limiter = RateLimiter()
+    state_tracker = StateTracker()
     
     # Create providers
     providers = []
@@ -86,7 +103,8 @@ async def lifespan(app: FastAPI):
         providers=providers,
         account_manager=account_manager,
         router=router,
-        rate_limiter=rate_limiter
+        rate_limiter=rate_limiter,
+        state_tracker=state_tracker
     )
     
     logger.info("LLM API Aggregator started successfully.") # Added a period
@@ -161,6 +179,12 @@ async def health_check():
         "providers": provider_health,
         "timestamp": time.time()
     }
+
+
+@app.get("/metrics")
+async def metrics():
+    """Prometheus metrics endpoint."""
+    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 @app.post("/v1/chat/completions", response_model=ChatCompletionResponse)

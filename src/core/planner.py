@@ -6,7 +6,7 @@ from .planning_structures import ExecutionPlan, Task, TaskStatus, ProjectContext
 # We need access to LLMAggregator. This might require some refactoring
 # or specific instantiation logic later. For now, let's assume it can be passed.
 from .aggregator import LLMAggregator
-from ..models import ChatCompletionRequest, Message
+from ..models import ChatCompletionRequest, ChatMessage as Message
 
 
 logger = structlog.get_logger(__name__)

@@ -25,12 +25,12 @@ from rich.progress import Progress, SpinnerColumn, TextColumn
 from src.core.aggregator import LLMAggregator
 from src.core.auto_updater import AutoUpdater, integrate_auto_updater
 from src.core.account_manager import AccountManager
-from src.core.router import IntelligentRouter
+from src.core.router import ProviderRouter
 from src.core.rate_limiter import RateLimiter
 from src.providers.openrouter import OpenRouterProvider
 from src.providers.groq import GroqProvider
 from src.providers.cerebras import CerebrasProvider
-from src.models import ChatCompletionRequest, Message
+from src.models import ChatCompletionRequest, ChatMessage as Message
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -66,7 +66,8 @@ async def test_auto_updater_integration():
     
     # Create supporting components
     account_manager = AccountManager()
-    router = IntelligentRouter()
+    provider_configs = {provider.name: provider.config for provider in providers}
+    router = ProviderRouter(providers=provider_configs)
     rate_limiter = RateLimiter()
     
     # Create aggregator with auto-updater enabled

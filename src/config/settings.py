@@ -11,6 +11,7 @@ class Settings(BaseSettings):
     REDIS_URL: Optional[str] = None
 
     # General Application Settings
+    APP_ENV: str = "development"
     LOG_LEVEL: str = "INFO"
     OPENHANDS_ENCRYPTION_KEY: Optional[str] = None
 
