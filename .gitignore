@@ -13,6 +13,8 @@ model_memory.db
 *.log
 logs/
 LOGS/
+audit_logs/
+memory/
 
 # Python cache and virtual environments
 __pycache__/
