@@ -18,7 +18,7 @@ def apply_fixes():
         with open('.env', 'w') as f:
             f.write("""# Security
 ADMIN_TOKEN=change-this-secure-token
-ALLOWED_ORIGINS=http://localhost:3000
+ALLOWED_ORIGINS=http://localhost:3000,http://127.0.0.1:3000
 
 # Database
 DATABASE_URL=sqlite:///./model_memory.db
