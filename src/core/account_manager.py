@@ -5,7 +5,7 @@ Account and credentials management system.
 import asyncio
 import structlog # Changed from logging
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any
 from cryptography.fernet import Fernet
 import json
 import os
@@ -170,8 +170,7 @@ class AccountManager:
                     found_to_mark = True
 
         if found_to_mark:
-        
-        await self.save_credentials()
+            await self.save_credentials()
     
     async def set_rate_limit_reset(self, provider: str, account_id: str, reset_time: datetime) -> None:
         """
