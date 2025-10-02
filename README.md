@@ -97,11 +97,24 @@ Integrates with existing GitHub projects:
 
 ```bash
 # Run auto-updater demo
-python auto_updater_demo.py
+python examples/auto_updater_demo.py
 
 # Test integration
-python test_auto_updater_integration.py
+python scripts/test_auto_updater_integration.py
 ```
+
+## 📁 Project Structure
+
+The project is organized into clear directories:
+
+- **src/**: Core source code (providers, api, core logic)
+- **tests/**: Comprehensive test suite
+- **config/**: YAML configuration files
+- **docs/**: Complete documentation
+- **examples/**: Demo scripts and examples
+- **scripts/**: Utility scripts for development
+
+See [FILE_STRUCTURE.md](FILE_STRUCTURE.md) for detailed structure documentation.
 
 ## Quick Start
 

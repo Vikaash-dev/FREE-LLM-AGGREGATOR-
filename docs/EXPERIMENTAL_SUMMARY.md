@@ -150,13 +150,13 @@ The experimental demo successfully demonstrated all components:
 ### Quick Start
 ```bash
 # Run the experimental demo
-python experimental_demo.py
+python examples/experimental_demo.py
 
 # Start the experimental aggregator
-python experimental_optimizer.py --mode=local
+python examples/experimental_optimizer.py --mode=local
 
 # Windows service installation
-python experimental_optimizer.py --mode=service
+python examples/experimental_optimizer.py --mode=service
 ```
 
 ### Integration Example

@@ -84,3 +84,8 @@ docker-compose.yml
 # OS generated files
 .DS_Store
 Thumbs.db
+
+# Archive files
+*.tar.gz
+*.zip
+*.rar

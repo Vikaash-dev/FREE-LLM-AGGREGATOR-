@@ -175,13 +175,13 @@ openhands-ai-scientist/
    python experimental_demo.py
    
    # AI-Scientist system
-   python ai_scientist_openhands.py
+   python examples/ai_scientist_openhands.py
    
    # Recursive optimizer
-   python recursive_optimizer.py
+   python examples/recursive_optimizer.py
    
    # OpenHands improver
-   python openhands_improver.py
+   python examples/openhands_improver.py
    ```
 
 ## 🔧 Configuration
@@ -229,32 +229,32 @@ providers:
 
 ### 1. Basic Functionality Test
 ```bash
-python demo.py
+python examples/demo.py
 ```
 
 ### 2. Research Integration Test
 ```bash
-python enhanced_demo.py
+python examples/enhanced_demo.py
 ```
 
 ### 3. Experimental Features Test
 ```bash
-python experimental_demo.py
+python examples/experimental_demo.py
 ```
 
 ### 4. AI-Scientist System Test
 ```bash
-python ai_scientist_openhands.py
+python examples/ai_scientist_openhands.py
 ```
 
 ### 5. Recursive Optimization Test
 ```bash
-python recursive_optimizer.py
+python examples/recursive_optimizer.py
 ```
 
 ### 6. OpenHands Improvement Test
 ```bash
-python openhands_improver.py
+python examples/openhands_improver.py
 ```
 
 ## 📊 Performance Metrics
