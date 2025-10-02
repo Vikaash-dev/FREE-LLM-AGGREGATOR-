@@ -21,7 +21,14 @@ import hashlib
 import httpx
 import yaml
 from bs4 import BeautifulSoup
-from playwright.async_api import async_playwright
+
+# Optional playwright import for browser automation
+try:
+    from playwright.async_api import async_playwright
+    PLAYWRIGHT_AVAILABLE = True
+except ImportError:
+    PLAYWRIGHT_AVAILABLE = False
+    async_playwright = None
 
 from ..models import ProviderConfig, ModelInfo, ProviderStatus
 from .account_manager import AccountManager
@@ -481,6 +488,13 @@ class AutoUpdater:
         updates = []
         
         if not source.enabled:
+            return updates
+        
+        if not PLAYWRIGHT_AVAILABLE:
+            logger.warning(
+                "Browser automation requested but playwright not available. "
+                "Install playwright with: pip install playwright && playwright install"
+            )
             return updates
         
         try:

@@ -1191,7 +1191,7 @@ class LLMAggregator:
             'overall_complexity': complexity.overall_complexity
         }
     
-    async def get_model_recommendations(self, request: ChatCompletionRequest) -> Dict[str, Any]]:
+    async def get_model_recommendations(self, request: ChatCompletionRequest) -> Dict[str, Any]:
         """
         Provides model recommendations for a given request.
 
@@ -1251,7 +1251,7 @@ class LLMAggregator:
         except Exception as e:
             logger.error("Error starting auto-updater", error=str(e), exc_info=True)
     
-    async def force_update_providers(self) -> Dict[str, Any]]:
+    async def force_update_providers(self) -> Dict[str, Any]:
         """
         Forces an immediate update of all provider information via the auto-updater.
 
@@ -1290,7 +1290,7 @@ class LLMAggregator:
             logger.error("Error forcing provider updates", error=str(e), exc_info=True)
             return {"error": str(e)}
     
-    async def get_auto_update_status(self) -> Dict[str, Any]]:
+    async def get_auto_update_status(self) -> Dict[str, Any]:
         """
         Retrieves the current status of the auto-updater.
 
@@ -1313,7 +1313,7 @@ class LLMAggregator:
             logger.error("Error getting auto-update status", error=str(e), exc_info=True)
             return {"enabled": True, "error": str(e)}
     
-    async def configure_auto_updater(self, config: Dict[str, Any]) -> Dict[str, Any]]:
+    async def configure_auto_updater(self, config: Dict[str, Any]) -> Dict[str, Any]:
         """
         Configures settings for the auto-updater.
 
@@ -1360,7 +1360,7 @@ class LLMAggregator:
             logger.error("Error configuring auto-updater", config_options=config, error=str(e), exc_info=True)
             return {"error": str(e)}
     
-    async def get_provider_updates_history(self, provider_name: Optional[str] = None) -> Dict[str, Any]]:
+    async def get_provider_updates_history(self, provider_name: Optional[str] = None) -> Dict[str, Any]:
         """
         Retrieves the history of provider updates from the auto-updater.
 

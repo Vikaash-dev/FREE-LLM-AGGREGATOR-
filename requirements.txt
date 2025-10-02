@@ -13,7 +13,7 @@ redis==5.0.1
 # sqlite3 is built into Python
 
 # Security and encryption
-cryptography==41.0.8
+cryptography>=42.0.0
 python-jose[cryptography]==3.3.0
 passlib[bcrypt]==1.7.4
 
@@ -50,6 +50,7 @@ beautifulsoup4>=4.12.0
 playwright>=1.40.0
 lxml>=4.9.0
 
-# Enhanced research features
-torch>=2.0.0
-numpy>=1.24.0
+# Enhanced research features (now optional)
+# Install with: pip install -r requirements-ml.txt
+# torch>=2.0.0
+# numpy>=1.24.0
