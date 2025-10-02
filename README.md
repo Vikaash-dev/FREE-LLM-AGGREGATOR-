@@ -29,6 +29,7 @@ The user needs a system that can:
 - 🔄 **Auto-Updater**: Automatic discovery of new providers and models
 - 🧠 **Meta-Controller**: Research-based intelligent model selection
 - 🎯 **Ensemble System**: Multi-model response fusion and quality assessment
+- 🎓 **ADA-7 Framework**: Advanced Development Assistant for structured, evidence-based development
 
 ## Supported Providers
 
@@ -206,6 +207,46 @@ fallback_chains:
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines on how to contribute to this project.
+
+## ADA-7 Framework
+
+This project now includes the **ADA-7 (Advanced Development Assistant)** framework for structured, evidence-based software development. ADA-7 provides a comprehensive methodology for creating high-quality applications through 7 evolutionary stages.
+
+### Quick Start with ADA-7
+
+```bash
+# View framework information
+python ada7_cli.py info
+
+# Run interactive demo
+python ada7_cli.py demo
+
+# View complete guide
+python ada7_cli.py guide
+
+# Start new project
+python ada7_cli.py new --name "My Project"
+```
+
+### 7 Evolutionary Stages
+
+1. **Requirements Analysis** - User personas, competitive analysis, feature gaps
+2. **Architecture Design** - 3 options with academic validation and decision matrix
+3. **Component Design** - Technology selection, development estimates
+4. **Implementation** - MVP definition, sprint planning, CI/CD setup
+5. **Testing Framework** - Test pyramid, quality gates, failure protocols
+6. **Deployment** - Infrastructure as code, security, monitoring
+7. **Maintenance** - Technical debt tracking, evolution roadmap
+
+### Evidence-Based Development
+
+Every major decision in ADA-7 requires:
+- 2+ academic papers (arXiv with citations)
+- 3+ production examples (GitHub repos with metrics)
+- Quantified performance data
+- Risk assessment with mitigations
+
+For complete documentation, see [ADA_7_FRAMEWORK.md](ADA_7_FRAMEWORK.md)
 
 ## License
 
