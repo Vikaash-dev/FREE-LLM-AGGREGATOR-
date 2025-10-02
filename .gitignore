@@ -84,3 +84,9 @@ docker-compose.yml
 # OS generated files
 .DS_Store
 Thumbs.db
+
+# Security
+# Cache
+# ML Models
+models/
+checkpoints/

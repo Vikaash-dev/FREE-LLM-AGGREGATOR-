@@ -50,6 +50,7 @@ beautifulsoup4>=4.12.0
 playwright>=1.40.0
 lxml>=4.9.0
 
-# Enhanced research features
-torch>=2.0.0
-numpy>=1.24.0
+# Enhanced research features (now optional)
+# Install with: pip install -r requirements-ml.txt
+# torch>=2.0.0
+# numpy>=1.24.0
