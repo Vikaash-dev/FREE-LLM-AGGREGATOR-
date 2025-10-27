@@ -238,18 +238,18 @@ pip install pywin32  # Windows only
 
 1. **Run the experimental demo**:
 ```bash
-python experimental_demo.py
+python examples/experimental_demo.py
 ```
 
 2. **Start the experimental aggregator**:
 ```bash
-python experimental_optimizer.py --mode=local
+python examples/experimental_optimizer.py --mode=local
 ```
 
 3. **Windows service installation**:
 ```bash
 # Windows only
-python experimental_optimizer.py --mode=service
+python examples/experimental_optimizer.py --mode=service
 ```
 
 ### Configuration

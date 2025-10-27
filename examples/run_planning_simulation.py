@@ -3,30 +3,29 @@ import os
 import sys
 import time # For simulating execution time
 
-# Ensure src directory is in Python path
-# This might be needed if running the script directly from the root
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), 'src')))
+# Ensure parent directory is in Python path to access src
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from config.logging_config import setup_logging # Assuming this path
+from src.config.logging_config import setup_logging # Assuming this path
 setup_logging() # Initialize logging early
 
 import structlog
 
-from core.planning_structures import ProjectContext, TaskStatus, TaskResult
-from core.planner import DevikaInspiredPlanner
-from core.reasoner import ContextualReasoningEngine
-from core.state_tracker import StateTracker
+from src.core.planning_structures import ProjectContext, TaskStatus, TaskResult
+from src.core.planner import DevikaInspiredPlanner
+from src.core.reasoner import ContextualReasoningEngine
+from src.core.state_tracker import StateTracker
 
 # For LLMAggregator instantiation, we need to set up its dependencies.
 # This is a simplified setup for the simulation script.
 # In a full application, these would be managed more robustly (e.g., via DI or a central app context).
-from core.aggregator import LLMAggregator
-from core.account_manager import AccountManager
-from core.router import ProviderRouter # ProviderRouter needs provider_configs
-from core.rate_limiter import RateLimiter
+from src.core.aggregator import LLMAggregator
+from src.core.account_manager import AccountManager
+from src.core.router import ProviderRouter # ProviderRouter needs provider_configs
+from src.core.rate_limiter import RateLimiter
 # Mock provider configs for ProviderRouter as we aren't making real calls that need routing here
 # but the objects might be expected by constructors.
-from models import ProviderConfig as OpenHandsProviderConfig, ProviderStatus
+from src.models import ProviderConfig as OpenHandsProviderConfig, ProviderStatus
 
 # Import IntelligentResearchAssistant and its components, and ResearchQuery
 from core.researcher import IntelligentResearchAssistant
