@@ -1,10 +1,12 @@
-from typing import List, Optional
+from typing import List, Optional, Union
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import field_validator
 
 class Settings(BaseSettings):
     # API Server Settings
     ADMIN_TOKEN: Optional[str] = None
-    ALLOWED_ORIGINS: List[str] = ["http://localhost:3000"]
+    # Use Union to allow string input which will be converted to list
+    ALLOWED_ORIGINS: Union[List[str], str] = ["http://localhost:3000"]
 
     # Database Settings
     DATABASE_URL: str = "sqlite:///./model_memory.db"
@@ -24,6 +26,15 @@ class Settings(BaseSettings):
 
     # Auto Updater Settings
     AUTO_UPDATE_INTERVAL_MINUTES: int = 60
+
+    @field_validator('ALLOWED_ORIGINS', mode='before')
+    @classmethod
+    def parse_origins(cls, v):
+        """Parse ALLOWED_ORIGINS from string or list."""
+        if isinstance(v, str):
+            # Split by comma
+            return [origin.strip() for origin in v.split(',') if origin.strip()]
+        return v
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding='utf-8', extra='ignore')
 
