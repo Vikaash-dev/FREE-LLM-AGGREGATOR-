@@ -1,5 +1,5 @@
 from typing import Dict, Any, List, Optional
-import datetime
+from datetime import datetime, UTC
 import structlog
 
 # Assuming TaskResult and other relevant structures might be useful for context,
@@ -22,7 +22,7 @@ class StateTracker:
         logger.info("StateTracker initialized (Phase 1: Basic Logging).")
 
     def _log_event(self, event_type: str, plan_id: Optional[str], task_id: Optional[str], details: Dict[str, Any]):
-        timestamp = datetime.datetime.now(datetime.UTC).isoformat()
+        timestamp = datetime.now(UTC).isoformat()
         log_entry = {
             "timestamp": timestamp,
             "event_type": event_type,
