@@ -22,7 +22,7 @@ class StateTracker:
         logger.info("StateTracker initialized (Phase 1: Basic Logging).")
 
     def _log_event(self, event_type: str, plan_id: Optional[str], task_id: Optional[str], details: Dict[str, Any]):
-        timestamp = datetime.datetime.utcnow().isoformat()
+        timestamp = datetime.datetime.now(datetime.UTC).isoformat()
         log_entry = {
             "timestamp": timestamp,
             "event_type": event_type,
