@@ -25,8 +25,8 @@ class ProjectContext:
 @dataclass
 class Task:
     '''Represents a single task or sub-task within an execution plan.'''
+    description: str  # Required field must come first
     task_id: str = field(default_factory=lambda: str(uuid.uuid4()))
-    description: str
     status: TaskStatus = TaskStatus.PENDING
     dependencies: List[str] = field(default_factory=list)  # List of task_ids this task depends on
     parent_task_id: Optional[str] = None # For hierarchical tasks, if any
@@ -42,8 +42,8 @@ class Task:
 @dataclass
 class ExecutionPlan:
     '''Represents a plan to achieve a high-level goal, composed of multiple tasks.'''
+    user_instruction: str  # Required field must come first
     plan_id: str = field(default_factory=lambda: str(uuid.uuid4()))
-    user_instruction: str # The original high-level instruction from the user
     parsed_intent: Dict[str, Any] = field(default_factory=dict) # Structured intent from NLP parsing
     tasks: List[Task] = field(default_factory=list)
     overall_status: TaskStatus = TaskStatus.PENDING
